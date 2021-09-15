@@ -118,21 +118,21 @@ vmalloc系列的函数最终会调用`__vmalloc_node_range`函数，该函数的
 
 #### slab函数图
 
-![image-20210915160044184](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210915160044184.png)
+![image-20210915160044184](./img/image-20210915160044184.png)
 
 #### buddy函数图
 
 ##### 图1
 
-![image-20210915160149629](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210915160149629.png)
+![image-20210915160149629](./img/image-20210915160149629.png)
 
 ##### 图2
 
-![image-20210915160203145](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210915160203145.png)
+![image-20210915160203145](./img/image-20210915160203145.png)
 
 #### vmalloc函数图
 
-![image-20210915161246004](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210915161246004.png)
+![image-20210915161246004](./img/image-20210915161246004.png)
 
 #### 参与贡献
 
