@@ -1,1 +1,0 @@
-cmd_/home/openeuler/print_module/print_module.ko := ld -r -m elf_x86_64  -z max-page-size=0x200000 -T ./scripts/module-common.lds  --build-id  -o /home/openeuler/print_module/print_module.ko /home/openeuler/print_module/print_module.o /home/openeuler/print_module/print_module.mod.o ;  true
