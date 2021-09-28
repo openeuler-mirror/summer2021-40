@@ -1,0 +1,394 @@
+From b45c55884be478c86741292c8ee5f09a7c5bae50 Mon Sep 17 00:00:00 2001
+From: jiax <jiaxgong@163.com>
+Date: Tue, 28 Sep 2021 20:02:27 +0800
+Subject: [PATCH 2/4] slab
+
+---
+ include/linux/slab.h          |  15 ++++
+ include/linux/statis_memory.h |  36 +++++++++
+ kernel/Makefile               |   3 +
+ kernel/statis_memory.c        | 139 ++++++++++++++++++++++++++++++++++
+ mm/slab_common.c              |  10 ++-
+ mm/slub.c                     |  56 +++++++++++++-
+ 6 files changed, 256 insertions(+), 3 deletions(-)
+ create mode 100644 include/linux/statis_memory.h
+ create mode 100644 kernel/statis_memory.c
+
+diff --git a/include/linux/slab.h b/include/linux/slab.h
+index 788f04a7ca76..e54306aeccd4 100644
+--- a/include/linux/slab.h
++++ b/include/linux/slab.h
+@@ -18,6 +18,14 @@
+ #include <linux/workqueue.h>
+ #include <linux/percpu-refcount.h>
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++#include <linux/statis_memory.h>
++#endif
++
++#ifdef CONFIG_DEBUG_KMALLOC
++struct alloc_addr_list *alloc_record_pl(gfp_t gfp);
++void free_record_pl(struct alloc_addr_list *pl);
++#endif
+ 
+ /*
+  * Flags to pass to kmem_cache_create().
+@@ -481,7 +489,14 @@ kmalloc_order_trace(size_t size, gfp_t flags, unsigned int order)
+ static __always_inline void *kmalloc_large(size_t size, gfp_t flags)
+ {
+ 	unsigned int order = get_order(size);
++#ifdef CONFIG_DEBUG_KMALLOC
++	unsigned long caller_address = (unsigned long)get_pc();
++	void* addr = kmalloc_order_trace(size, flags, order);
++	record_to_sysfs_page(caller_address, (unsigned long)addr, 1<<order);
++	return addr;
++#else
+ 	return kmalloc_order_trace(size, flags, order);
++#endif
+ }
+ 
+ /**
+diff --git a/include/linux/statis_memory.h b/include/linux/statis_memory.h
+new file mode 100644
+index 000000000000..509366f30220
+--- /dev/null
++++ b/include/linux/statis_memory.h
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * statistical module memory 
++ *
++ */
++#ifndef _LINUX_STATIS_MEMORY_H
++#define _LINUX_STATIS_MEMORY_H
++
++#include <linux/kobject.h>
++#include <linux/module.h>
++#include <linux/kernel.h>
++
++typedef enum {
++    SLAB,
++    DMA_POOL
++}call_function_t;
++
++void* get_pc(void) __attribute__ ((__noinline__)) ;
++
++void record_to_sysfs_type(unsigned long caller_address, void* x, size_t size, call_function_t cf_type);
++
++void free_mem_record_type(unsigned long caller_address, void* x, size_t size, call_function_t cf_type);
++
++void record_to_sysfs_page(unsigned long caller_address, unsigned long addr, unsigned long cnt);
++
++void free_mem_record_page(unsigned long caller_address, unsigned long addr, unsigned long cnt);
++
++void record_to_sysfs_percpu(unsigned long caller_address, void __percpu *x, size_t size);
++
++void free_mem_record_percpu(unsigned long caller_address, void __percpu *x, size_t size);
++
++void record_to_sysfs_dmapool(unsigned long caller_address, void *x, size_t size);
++
++void free_mem_record_dmapool(unsigned long caller_address, void *x, size_t size);
++
++#endif
+diff --git a/kernel/Makefile b/kernel/Makefile
+index ccc3a9c47930..04dd43fbfedb 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -12,6 +12,9 @@ obj-y     = fork.o exec_domain.o panic.o \
+ 	    notifier.o ksysfs.o cred.o reboot.o \
+ 	    async.o range.o smpboot.o ucount.o ktask.o
+ 
++
++obj-$(CONFIG_DEBUG_KMALLOC) += statis_memory.o
++
+ obj-$(CONFIG_MODULES) += kmod.o
+ obj-$(CONFIG_MULTIUSER) += groups.o
+ 
+diff --git a/kernel/statis_memory.c b/kernel/statis_memory.c
+new file mode 100644
+index 000000000000..a428db56f841
+--- /dev/null
++++ b/kernel/statis_memory.c
+@@ -0,0 +1,139 @@
++#include <linux/slab.h>
++#include <linux/statis_memory.h>
++#include <linux/mm.h>
++
++#define MAX_PAGE_ELEMENTS (PAGE_SIZE / sizeof(unsigned long))
++
++static void __do_record(struct used_memory_t* used_t, unsigned long val, unsigned long inc_val)
++{
++    int i = 0, flag = 0;
++    unsigned long *page_value;
++    struct alloc_addr_list* addr_list = used_t->addr_list;
++
++    while(addr_list){
++        // page was full, search next page
++        if(atomic_read(&addr_list->page_elements) == MAX_PAGE_ELEMENTS){
++            addr_list = addr_list->next;
++            continue;
++        }
++        page_value = (unsigned long*)page_address(addr_list->page);
++        for(i = 0; i < MAX_PAGE_ELEMENTS; i++){
++            if(page_value[i] == 0){
++                page_value[i] = val;
++                flag = 1;
++                break;
++            }
++        }
++        if(flag)
++            break;
++        addr_list = addr_list->next;
++    }
++    //all pages was full, alloc a new page to record
++    if(!flag){
++        struct alloc_addr_list *new_list = alloc_record_pl(GFP_KERNEL);
++        page_value = (unsigned long*)page_address(new_list->page);
++        //record
++        page_value[0] = val;
++        new_list->next = used_t->addr_list;
++        used_t->addr_list = new_list;
++        addr_list = new_list;
++    }
++    atomic_inc(&addr_list->page_elements);
++    atomic64_add(inc_val, &used_t->used);
++}
++
++static void __do_record_free(struct used_memory_t* used_t, unsigned long val, unsigned long dec_val)
++{
++    int i = 0, flag = 0;
++    unsigned long *page_value;
++    struct alloc_addr_list* pre_list = NULL;
++    struct alloc_addr_list* addr_list = used_t->addr_list;
++
++    while(addr_list){
++        page_value = (unsigned long*)page_address(addr_list->page);
++        for(i = 0; i < MAX_PAGE_ELEMENTS; i++){
++            if(page_value[i] == val){
++                // free was alloced before
++                flag = 1;
++                //release memory record
++                page_value[i] = 0;
++                break;
++            }
++        }
++        if(flag){
++            if(atomic_dec_and_test(&addr_list->page_elements)){
++                if(pre_list)
++                    pre_list->next = addr_list->next;
++                else
++                    used_t->addr_list = addr_list->next;
++                free_record_pl(addr_list);
++            }
++            atomic64_sub(dec_val, &used_t->used);
++            return;
++        }
++        pre_list = addr_list;
++        addr_list = addr_list->next;
++    }
++}
++
++void* get_pc(void)
++{
++    return (void*)__builtin_return_address(0);
++}
++EXPORT_SYMBOL(get_pc);
++
++void record_to_sysfs_type(unsigned long caller_address, void* x, size_t size, call_function_t cf_type)
++{
++    unsigned long val = (unsigned long)x;
++    unsigned long inc_val = (unsigned long)size;
++    struct module *mod = __module_text_address(caller_address);
++    if(mod != NULL)
++        __do_record(&mod->mkobj.slab_t, val, inc_val);
++}
++EXPORT_SYMBOL(record_to_sysfs_type);
++
++void record_to_sysfs_page(unsigned long caller_address, unsigned long addr, unsigned long cnt)
++{
++    struct module *mod = __module_text_address(caller_address);
++    if(mod != NULL)
++        __do_record(&mod->mkobj.page_t, addr, cnt);
++}
++EXPORT_SYMBOL(record_to_sysfs_page);
++
++void record_to_sysfs_percpu(unsigned long caller_address, void __percpu *x, size_t size)
++{
++    unsigned long val = (unsigned long)x;
++    unsigned long inc_val = (unsigned long)size;
++    struct module *mod = __module_text_address(caller_address);
++    if(mod != NULL)
++        __do_record(&mod->mkobj.percpu_t, val, inc_val);
++}
++EXPORT_SYMBOL(record_to_sysfs_percpu);
++
++void free_mem_record_type(unsigned long caller_address, void* x, size_t size, call_function_t cf_type)
++{
++    unsigned long val = (unsigned long)x;
++    unsigned long dec_val = (unsigned long)size;
++    struct module *mod = __module_text_address(caller_address);
++    if(mod != NULL)
++        __do_record_free(&mod->mkobj.slab_t, val, dec_val);
++}
++EXPORT_SYMBOL(free_mem_record_type);
++
++void free_mem_record_page(unsigned long caller_address, unsigned long addr, unsigned long cnt)
++{
++    struct module *mod = __module_text_address(caller_address);
++    if(mod != NULL)
++        __do_record_free(&mod->mkobj.page_t, addr, cnt);
++}
++EXPORT_SYMBOL(free_mem_record_page);
++
++void free_mem_record_percpu(unsigned long caller_address, void __percpu *x, size_t size)
++{
++    unsigned long val = (unsigned long)x;
++    unsigned long dec_val = (unsigned long)size;
++    struct module *mod = __module_text_address(caller_address);
++    if(mod != NULL)
++        __do_record_free(&mod->mkobj.percpu_t, val, dec_val);
++}
++EXPORT_SYMBOL(free_mem_record_percpu);
+\ No newline at end of file
+diff --git a/mm/slab_common.c b/mm/slab_common.c
+index d208b47e01a8..8ba0cb557633 100644
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@ -1596,7 +1596,6 @@ static __always_inline void *__do_krealloc(const void *p, size_t new_size,
+ 
+ 	return ret;
+ }
+-
+ /**
+  * __krealloc - like krealloc() but don't free @p.
+  * @p: object to reallocate memory for.
+@@ -1613,7 +1612,6 @@ void *__krealloc(const void *p, size_t new_size, gfp_t flags)
+ 		return ZERO_SIZE_PTR;
+ 
+ 	return __do_krealloc(p, new_size, flags);
+-
+ }
+ EXPORT_SYMBOL(__krealloc);
+ 
+@@ -1664,6 +1662,14 @@ void kzfree(const void *p)
+ 	if (unlikely(ZERO_OR_NULL_PTR(mem)))
+ 		return;
+ 	ks = ksize(mem);
++#ifdef CONFIG_DEBUG_KMALLOC
++	struct page *page = virt_to_head_page(mem);
++	unsigned long caller_address = (unsigned long)_RET_IP_;
++	if (unlikely(!PageSlab(page)))
++		free_mem_record_page(caller_address, (unsigned long)page_address(page), 1<<compound_order(page));
++	else
++		free_mem_record_type(caller_address, mem, ks, SLAB);
++#endif
+ 	memzero_explicit(mem, ks);
+ 	kfree(mem);
+ }
+diff --git a/mm/slub.c b/mm/slub.c
+index 30683ffe1823..f328c41ceb76 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -2730,6 +2730,10 @@ static __always_inline void *slab_alloc_node(struct kmem_cache *s,
+ 
+ 	slab_post_alloc_hook(s, gfpflags, 1, &object);
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++	record_to_sysfs_type((unsigned long)_RET_IP_, object, s->object_size, SLAB);
++#endif
++
+ 	return object;
+ }
+ 
+@@ -2993,6 +2997,9 @@ void kmem_cache_free(struct kmem_cache *s, void *x)
+ 	s = cache_from_obj(s, x);
+ 	if (!s)
+ 		return;
++#ifdef CONFIG_DEBUG_KMALLOC
++	free_mem_record_type((unsigned long)_RET_IP_, x, s->object_size, SLAB);
++#endif
+ 	slab_free(s, virt_to_head_page(x), x, NULL, 1, _RET_IP_);
+ 	trace_kmem_cache_free(_RET_IP_, x);
+ }
+@@ -3771,8 +3778,16 @@ void *__kmalloc(size_t size, gfp_t flags)
+ 	struct kmem_cache *s;
+ 	void *ret;
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++	if (unlikely(size > KMALLOC_MAX_CACHE_SIZE)){
++		void *ret = kmalloc_large(size, flags);
++		record_to_sysfs_page((unsigned long)_RET_IP_, (unsigned long)ret, 1<<get_order(size));
++		return ret;
++	}
++#else
+ 	if (unlikely(size > KMALLOC_MAX_CACHE_SIZE))
+ 		return kmalloc_large(size, flags);
++#endif
+ 
+ 	s = kmalloc_slab(size, flags);
+ 
+@@ -3815,7 +3830,10 @@ void *__kmalloc_node(size_t size, gfp_t flags, int node)
+ 		trace_kmalloc_node(_RET_IP_, ret,
+ 				   size, PAGE_SIZE << get_order(size),
+ 				   flags, node);
+-
++#ifdef CONFIG_DEBUG_KMALLOC
++		if(ret)
++			record_to_sysfs_page((unsigned long)_RET_IP_, (unsigned long)ret, 1<<get_order(size));
++#endif
+ 		return ret;
+ 	}
+ 
+@@ -3935,13 +3953,49 @@ void kfree(const void *x)
+ 	if (unlikely(!PageSlab(page))) {
+ 		BUG_ON(!PageCompound(page));
+ 		kfree_hook(object);
++#ifdef CONFIG_DEBUG_KMALLOC
++		free_mem_record_page((unsigned long)_RET_IP_, (unsigned long)page_address(page), 1<<compound_order(page));
++#endif
+ 		__free_pages(page, compound_order(page));
+ 		return;
+ 	}
++	free_mem_record_type((unsigned long)_RET_IP_, object, ksize(object), SLAB);
+ 	slab_free(page->slab_cache, page, object, NULL, 1, _RET_IP_);
+ }
+ EXPORT_SYMBOL(kfree);
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++struct alloc_addr_list *alloc_record_pl(gfp_t gfp)
++{
++	struct alloc_addr_list *al;
++	struct kmem_cache *s;
++
++    s = kmalloc_slab(sizeof(*al), gfp);
++
++    al = slab_alloc(s, gfp, _RET_IP_);
++
++	if (!al)
++		return NULL;
++
++	al->page = alloc_pages(gfp | __GFP_ZERO, 0);
++	if (!al->page) {
++		kfree(al);
++		return NULL;
++	}
++
++	al->next = NULL;
++	atomic_set(&al->page_elements, 0);
++
++	return al;
++}
++
++void free_record_pl(struct alloc_addr_list *al)
++{
++	__free_page(al->page);
++	kfree(al);
++}
++#endif
++
+ #define SHRINK_PROMOTE_MAX 32
+ 
+ /*
+-- 
+2.27.0
+
