@@ -1,0 +1,294 @@
+From aaadbbd7a095c19418507ea2b0f172aedbcd5511 Mon Sep 17 00:00:00 2001
+From: jiax <jiaxgong@163.com>
+Date: Tue, 28 Sep 2021 16:36:58 +0800
+Subject: [PATCH] add usedmemory to sysfs
+
+---
+ include/linux/module.h | 43 +++++++++++++++++++++++
+ kernel/module.c        | 34 ++++++++++++++++++
+ kernel/params.c        | 80 ++++++++++++++++++++++++++++++++++++++++++
+ mm/Kconfig             |  6 ++++
+ 4 files changed, 163 insertions(+)
+
+diff --git a/include/linux/module.h b/include/linux/module.h
+index e49023514820..59415c8928e7 100644
+--- a/include/linux/module.h
++++ b/include/linux/module.h
+@@ -42,13 +42,39 @@ struct modversion_info {
+ struct module;
+ struct exception_table_entry;
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++struct alloc_addr_list {
++    struct alloc_addr_list *next;
++    struct page *page;
++	atomic_t page_elements;
++};
++
++struct used_memory_t {
++	struct alloc_addr_list *addr_list;
++	atomic64_t used;
++};
++
+ struct module_kobject {
+ 	struct kobject kobj;
++	spinlock_t used_memory_lock;
++	struct used_memory_t slab_t;
++	struct used_memory_t page_t;
++	struct used_memory_t percpu_t;
++	struct used_memory_t dmapool_t;
+ 	struct module *mod;
+ 	struct kobject *drivers_dir;
+ 	struct module_param_attrs *mp;
+ 	struct completion *kobj_completion;
+ } __randomize_layout;
++#else
++struct module_kobject {
++	struct kobject kobj;
++	struct module *mod;
++	struct kobject *drivers_dir;
++	struct module_param_attrs *mp;
++	struct completion *kobj_completion;
++} __randomize_layout;
++#endif/*CONFIG_DEBUG_KMALLOC*/
+ 
+ struct module_attribute {
+ 	struct attribute attr;
+@@ -72,6 +98,18 @@ extern ssize_t __modver_version_show(struct module_attribute *,
+ 
+ extern struct module_attribute module_uevent;
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++
++struct module_usedmemory_attribute {
++	struct module_attribute mattr;
++	struct module* mod;
++	const char *used;
++} __attribute__ ((__aligned__(sizeof(void *))));
++
++extern ssize_t __module_usedmemory_show(struct module_attribute *,
++				     struct module_kobject *, char *);
++#endif
++
+ /* These are either module local, or the kernel's dummy ones. */
+ extern int init_module(void);
+ extern void cleanup_module(void);
+@@ -642,6 +680,11 @@ int unregister_module_notifier(struct notifier_block *nb);
+ 
+ extern void print_modules(void);
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++extern void print_modules_debug(void);
++struct list_head *get_module_list(void);
++#endif
++
+ static inline bool module_requested_async_probing(struct module *module)
+ {
+ 	return module && module->async_probe_requested;
+diff --git a/kernel/module.c b/kernel/module.c
+index 69d0e28804a8..1180f4133bc2 100644
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -70,6 +70,10 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/module.h>
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++#include <linux/statis_memory.h>
++#endif
++
+ #ifndef ARCH_SHF_SMALL
+ #define ARCH_SHF_SMALL 0
+ #endif
+@@ -3758,6 +3762,9 @@ static int load_module(struct load_info *info, const char __user *uargs,
+ 	struct module *mod;
+ 	long err = 0;
+ 	char *after_dashes;
++#ifdef CONFIG_DEBUG_KMALLOC
++	struct module_usedmemory_attribute *uattr;
++#endif
+ 
+ 	err = elf_header_check(info);
+ 	if (err)
+@@ -3894,6 +3901,29 @@ static int load_module(struct load_info *info, const char __user *uargs,
+ 			goto sysfs_cleanup;
+ 	}
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++	uattr = kzalloc(sizeof(struct module_usedmemory_attribute), GFP_KERNEL);
++	uattr->mattr.attr.name = "usedmemory";
++	uattr->mattr.attr.mode = S_IRUGO;
++	uattr->mattr.show = __module_usedmemory_show;
++	uattr->mod = mod;
++	uattr->used = "NULL";
++
++	atomic64_set(&mod->mkobj.slab_t.used, 0);
++	atomic64_set(&mod->mkobj.page_t.used, 0);
++	atomic64_set(&mod->mkobj.percpu_t.used, 0);
++	atomic64_set(&mod->mkobj.dmapool_t.used, 0);
++	mod->mkobj.slab_t.addr_list = NULL;
++	mod->mkobj.page_t.addr_list = NULL;
++	mod->mkobj.percpu_t.addr_list = NULL;
++	mod->mkobj.dmapool_t.addr_list = NULL;
++	spin_lock_init(&mod->mkobj.used_memory_lock);
++
++	err = sysfs_create_file(&mod->mkobj.kobj, &uattr->mattr.attr);
++	if (err < 0)
++		goto coming_cleanup;
++#endif
++
+ 	/* Get rid of temporary copy. */
+ 	free_copy(info);
+ 
+@@ -4476,6 +4506,10 @@ struct module *__module_text_address(unsigned long addr)
+ 	return mod;
+ }
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++EXPORT_SYMBOL(__module_text_address);
++#endif
++
+ /* Don't grab lock, we're oopsing. */
+ void print_modules(void)
+ {
+diff --git a/kernel/params.c b/kernel/params.c
+index ce89f757e6da..c9a4a7d82afb 100644
+--- a/kernel/params.c
++++ b/kernel/params.c
+@@ -740,10 +740,13 @@ void destroy_params(const struct kernel_param *params, unsigned num)
+ 			params[i].ops->free(params[i].arg);
+ }
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++#include <linux/statis_memory.h>
+ static struct module_kobject * __init locate_module_kobject(const char *name)
+ {
+ 	struct module_kobject *mk;
+ 	struct kobject *kobj;
++	//struct module_usedmemory_attribute *uattr;
+ 	int err;
+ 
+ 	kobj = kset_find_obj(module_kset, name);
+@@ -770,11 +773,56 @@ static struct module_kobject * __init locate_module_kobject(const char *name)
+ 
+ 		/* So that we hold reference in both cases. */
+ 		kobject_get(&mk->kobj);
++// #ifdef CONFIG_DEBUG_KMALLOC
++// 		uattr = kzalloc(sizeof(struct module_usedmemory_attribute), GFP_KERNEL);
++// 		uattr->mattr.attr.name = "usedmemory";
++// 		uattr->mattr.attr.mode = S_IRUGO;
++// 		uattr->mattr.show = __module_usedmemory_show;
++// 		uattr->mod = mk->mod;
++// 		uattr->used = "NULL";
++// 		mk->module_memory = kzalloc(MAX_STATIS_BUF_SIZE, GFP_KERNEL);
++// 		err = sysfs_create_file(&mk->kobj, &uattr->mattr.attr);
++// #endif
+ 	}
+ 
+ 	return mk;
+ }
+ 
++#else /*CONFIG_DEBUG_KMALLOC*/
++static struct module_kobject * __init locate_module_kobject(const char *name)
++{
++	struct module_kobject *mk;
++	struct kobject *kobj;
++	int err;
++
++	kobj = kset_find_obj(module_kset, name);
++	if (kobj) {
++		mk = to_module_kobject(kobj);
++	} else {
++		mk = kzalloc(sizeof(struct module_kobject), GFP_KERNEL);
++		BUG_ON(!mk);
++
++		mk->mod = THIS_MODULE;
++		mk->kobj.kset = module_kset;
++		err = kobject_init_and_add(&mk->kobj, &module_ktype, NULL,
++					   "%s", name);
++#ifdef CONFIG_MODULES
++		if (!err)
++			err = sysfs_create_file(&mk->kobj, &module_uevent.attr);
++#endif
++		if (err) {
++			kobject_put(&mk->kobj);
++			pr_crit("Adding module '%s' to sysfs failed (%d), the system may be unstable.\n",
++				name, err);
++			return NULL;
++		}
++
++		/* So that we hold reference in both cases. */
++		kobject_get(&mk->kobj);
++	}
++}
++#endif
++
+ static void __init kernel_add_sysfs_param(const char *name,
+ 					  const struct kernel_param *kparam,
+ 					  unsigned int name_skip)
+@@ -830,6 +878,7 @@ static void __init param_sysfs_builtin(void)
+ 			name_len = dot - kp->name + 1;
+ 			strlcpy(modname, kp->name, name_len);
+ 		}
++		//printk(KERN_DEBUG "kernel_param:%s\n", kp->name);
+ 		kernel_add_sysfs_param(modname, kp, name_len);
+ 	}
+ }
+@@ -867,6 +916,37 @@ static void __init version_sysfs_builtin(void)
+ 
+ /* module-related sysfs stuff */
+ 
++//adventural
++#ifdef CONFIG_DEBUG_KMALLOC
++
++ssize_t __module_usedmemory_show(struct module_attribute * mattr,
++				     struct module_kobject *mk, char* buf)
++{
++	int record_pages = 0;
++	int all_elements = 0;
++	struct alloc_addr_list *addr_list = mk->slab_t.addr_list;
++
++	unsigned long used_slab = atomic64_read(&mk->slab_t.used);
++	unsigned long used_pages = atomic64_read(&mk->page_t.used);
++	unsigned long used_percpu = atomic64_read(&mk->percpu_t.used);
++	unsigned long used_dmapool = atomic64_read(&mk->dmapool_t.used);
++
++	while(addr_list){
++		record_pages++;
++		all_elements += atomic_read(&addr_list->page_elements);
++		addr_list = addr_list->next;
++	}
++	
++	if(used_slab >= 1024*100)
++		return scnprintf(buf, PAGE_SIZE, "Record page:%d\nRecords:%d\nSlab:%ldkb\nPages:%ld\nPercpu:%ld\ndmapool:%ld\n",\
++			record_pages, all_elements, used_slab/1024, used_pages, used_percpu, used_dmapool);
++	else
++		return scnprintf(buf, PAGE_SIZE, "Record page:%d\nRecords:%d\nSlab:%ldbytes\nPages:%ld\nPercpu:%ld\ndmapool:%ld\n",\
++			record_pages, all_elements, used_slab, used_pages, used_percpu, used_dmapool);
++}
++
++#endif
++
+ static ssize_t module_attr_show(struct kobject *kobj,
+ 				struct attribute *attr,
+ 				char *buf)
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 12601505c4a4..5437c2504b99 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -1,6 +1,12 @@
+ 
+ menu "Memory Management options"
+ 
++config DEBUG_KMALLOC
++	bool "Kmalloc debug"
++	default y
++	help
++	 Hook kmalloc
++
+ config SELECT_MEMORY_MODEL
+ 	def_bool y
+ 	depends on ARCH_SELECT_MEMORY_MODEL
+-- 
+2.27.0
+
