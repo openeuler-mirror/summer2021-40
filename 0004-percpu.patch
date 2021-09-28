@@ -1,0 +1,118 @@
+From 00acc96bfb986009f0159c6db0fbacb0b2a58ac3 Mon Sep 17 00:00:00 2001
+From: jiax <jiaxgong@163.com>
+Date: Tue, 28 Sep 2021 20:20:30 +0800
+Subject: [PATCH 4/4] percpu
+
+---
+ include/linux/percpu.h |  5 +++++
+ mm/percpu.c            | 39 ++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 43 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/percpu.h b/include/linux/percpu.h
+index 70b7123f38c7..1ab45e995297 100644
+--- a/include/linux/percpu.h
++++ b/include/linux/percpu.h
+@@ -12,6 +12,11 @@
+ 
+ #include <asm/percpu.h>
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++extern void record_to_sysfs_percpu(unsigned long caller_address, void __percpu *x, size_t size);
++extern void free_mem_record_percpu(unsigned long caller_address, void __percpu *x, size_t size);
++#endif
++
+ /* enough to cover all DEFINE_PER_CPUs in modules */
+ #ifdef CONFIG_MODULES
+ #define PERCPU_MODULE_RESERVE		(8 << 10)
+diff --git a/mm/percpu.c b/mm/percpu.c
+index 092f777422d6..99c5e49b506d 100644
+--- a/mm/percpu.c
++++ b/mm/percpu.c
+@@ -1526,7 +1526,22 @@ static void __percpu *pcpu_alloc(size_t size, size_t align, bool reserved,
+ 	}
+ 	return NULL;
+ }
++#ifdef CONFIG_DEBUG_KMALLOC
++static void __percpu *pcpu_alloc_memhook(size_t size, size_t align, bool reserved,
++				 gfp_t gfp, unsigned long caller_address)
++{
++	void __percpu *ptr;
++	size_t bits;
++
++	ptr = pcpu_alloc(size, align, reserved, gfp);
++	size = ALIGN(size, PCPU_MIN_ALLOC_SIZE);
++	bits = size >> PCPU_MIN_ALLOC_SHIFT;
++	if(ptr)
++		record_to_sysfs_percpu(caller_address, ptr, bits * PCPU_MIN_ALLOC_SIZE);
+ 
++	return ptr;
++}
++#endif
+ /**
+  * __alloc_percpu_gfp - allocate dynamic percpu area
+  * @size: size of area to allocate in bytes
+@@ -1544,7 +1559,11 @@ static void __percpu *pcpu_alloc(size_t size, size_t align, bool reserved,
+  */
+ void __percpu *__alloc_percpu_gfp(size_t size, size_t align, gfp_t gfp)
+ {
++#ifdef CONFIG_DEBUG_KMALLOC
++	return pcpu_alloc_memhook(size, align, false, gfp, (unsigned long)_RET_IP_);
++#else
+ 	return pcpu_alloc(size, align, false, gfp);
++#endif
+ }
+ EXPORT_SYMBOL_GPL(__alloc_percpu_gfp);
+ 
+@@ -1557,7 +1576,11 @@ EXPORT_SYMBOL_GPL(__alloc_percpu_gfp);
+  */
+ void __percpu *__alloc_percpu(size_t size, size_t align)
+ {
++#ifdef CONFIG_DEBUG_KMALLOC
++	return pcpu_alloc_memhook(size, align, false, GFP_KERNEL, (unsigned long)_RET_IP_);
++#else
+ 	return pcpu_alloc(size, align, false, GFP_KERNEL);
++#endif
+ }
+ EXPORT_SYMBOL_GPL(__alloc_percpu);
+ 
+@@ -1579,7 +1602,11 @@ EXPORT_SYMBOL_GPL(__alloc_percpu);
+  */
+ void __percpu *__alloc_reserved_percpu(size_t size, size_t align)
+ {
++#ifdef CONFIG_DEBUG_KMALLOC
++	return pcpu_alloc_memhook(size, align, true, GFP_KERNEL, (unsigned long)_RET_IP_);
++#else
+ 	return pcpu_alloc(size, align, true, GFP_KERNEL);
++#endif
+ }
+ 
+ /**
+@@ -1723,7 +1750,9 @@ void free_percpu(void __percpu *ptr)
+ 	unsigned long flags;
+ 	int off;
+ 	bool need_balance = false;
+-
++#ifdef CONFIG_DEBUG_KMALLOC
++	int bit_off, end, bits;
++#endif
+ 	if (!ptr)
+ 		return;
+ 
+@@ -1736,6 +1765,14 @@ void free_percpu(void __percpu *ptr)
+ 	chunk = pcpu_chunk_addr_search(addr);
+ 	off = addr - chunk->base_addr;
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++	bit_off = off / PCPU_MIN_ALLOC_SIZE;
++	end = find_next_bit(chunk->bound_map, pcpu_chunk_map_bits(chunk),
++			    bit_off + 1);
++	bits = end - bit_off;
++	free_mem_record_percpu((unsigned long)_RET_IP_, ptr, bits * PCPU_MIN_ALLOC_SIZE);
++#endif
++
+ 	pcpu_free_area(chunk, off);
+ 
+ 	/* if there are more than one fully free chunks, wake up grim reaper */
+-- 
+2.27.0
+
