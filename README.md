@@ -5,134 +5,159 @@ https://gitee.com/openeuler-competition/summer-2021/issues/I3EFZU
 
 #### 文件说明
 
-0001-0001-statis.patch为中期考核的patch，完成了slab，memorypool的统计功能。
+old-patch文件夹内存放中期考核成果0001-statis.patch，以及9月15日初步完成的patch。
 
-0001-9-15.patch更新加入了buddy、percpu的内存分配统计功能。
+`0001-add-usedmemory-to-sysfs.patch`：完成sys目录下每个模块usedmemory的创建，在struct module及module_kobject当中添加了相应的数据结构。
 
-#### 辅助函数
+`0002-slab.patch`：完成slab统计的功能，因为需要添加相应的统计函数及记录结构体，新增加了两个文件statis_memory.c以及statis_memory.h。
 
-getfunction.py函数提取了mm模块当中所有通过EXPORT_SYMBOL导出的函数，然后与drivers目录去比对，drivers目录内的文件使用到的函数记录到found.txt当中，未使用到的记录到not-found.txt当中，作为统计函数来源的参考。
+`0003-buddy.patch`：完成buddy系统的统计功能。
 
-下面是筛选出来的函数一些与内存分配、释放相关的函数
+`0004-percpu.patch`：完成percpu系统的统计功能。
+
+`0005-add-split_page-krealloc.patch`：增加slab和buddy系统当中的几个额外函数。
+
+`0006-mempool.patch`：完成mempool的统计功能。
+
+#### 使用
+
+使用内核模块内存统计功能需要开启mm/Kconfig下的Kmalloc debug的配置选项
+
+![image-20210930191802163](.\img\image-20210930191802163.png)
+
+开启后会在sysfs下为每个模块（非built-in模块）创建一个usedmemory文件
+
+![image-20210930192645147](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210930192645147.png)
+
+usedmemory文件会记录该模块使用的内存情况
+
+![image-20210930193807280](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210930193807280.png)
+
+slab记录从slab中分配的内存，Pages记录从buddy中分配的页，Percpu记录percpu内存，dmapool记录从dmapool中分配的内存。
+
+#### 测试验证结果
+
+为了测试统计函数的准确性，使用一个模块print_module来分别测试slab、buddy、percpu、mempool相关函数的内存分配与释放情况。
+
+**kmalloc系列函数测试**
+
+slab：1472 = 256 + 192 + 512 + 512
+
+pages：4页来自于__kmalloc
+
+![image-20210930202847242](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210930202847242.png)
+
+free后均为0
+
+![image-20210930203128252](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210930203128252.png)
+
+**krealloc函数测试**
+
+使用krealloc重新分配8193字节，超过slab的限制，从buddy中分配4页
+
+![image-20210930203316535](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210930203316535.png)
+
+free后为0
+
+![image-20210930203910417](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210930203910417.png)
+
+**kmalloc_node系列函数测试**
+
+1312 = 32 + 32 + 96 + 1024 + 128
+
+![image-20210930204154433](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210930204154433.png)
+
+free后为0
+
+![image-20210930204429387](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210930204429387.png)
+
+**kmem_cache系列函数测试**
+
+mytest_struct结构体为28字节，创建kmem_cache时会分配32个字节
+
+分配两次一共是64 字节
 
 ```c
-get_page()
-put_page()
-
-bdi_register()
-bdi_put()
-
-balloon_page_alloc()---->alloc_page()
-
-// dma_pool
-dma_pool_create()--->kmalloc_node()
-dma_pool_destroy()
-dma_pool_alloc()--->pool_alloc_page()--->kmalloc()
-dma_pool_free()
-dmam_pool_create()
-dmam_pool_destroy()
-
-put_vaddr_frames()--->put_page()
-frame_vector_create()--->kvmalloc()
-frame_vector_destroy()--->kvfree()
-
-// mempool
-mempool_exit()
-mempool_destroy() 
-mempool_init()
-mempool_create()
-mempool_create_node()
-mempool_resize()
-mempool_alloc()
-mempool_free()
-mempool_alloc_slab()
-mempool_free_slab()
-mempool_kmalloc()
-mempool_kfree()
-
-// buddy
-__get_free_pages()
-get_zeroed_page()
-__free_pages()
-free_pages()
-__page_frag_cache_drain()
-page_frag_free()
-alloc_pages_exact()
-free_pages_exact()
-
-// percpu
-__alloc_percpu()
-free_percpu()
-
-sp_free()
-sp_alloc()
-
-// slab
-kmem_cache_alloc()
-kmem_cache_alloc_node() 
-kmem_cache_free()
-kfree()
-ksize()
-kmem_cache_size()
-kmem_cache_create_usercopy()
-kmem_cache_create()
-kmem_cache_destroy() 
-kmem_cache_shrink()
-krealloc()
-kzfree()
-kfree()
-
-put_pages_list()
-release_pages()
-__pagevec_release()
-kfree_const()
-
-// vmalloc
-kvmalloc_node()
-kvfree()
-vmalloc_to_page()
-vmalloc_to_pfn()
-vfree()
-__vmalloc()
-vmalloc()
-vzalloc()
-vmalloc_user()
-vmalloc_node()
-vzalloc_node()
-vmalloc_32()
-vmalloc_32_user()
-remap_vmalloc_range()
-alloc_vm_area()
-free_vm_area()
-
-zs_malloc()
-zs_free()
-zs_compact()
-zs_create_pool()
-zs_destroy_pool()
+struct mytest_struct{
+    char a[26];
+    char c;
+    char z;
+};
 ```
 
-##### 实际统计的有dma_pool、mempool、buddy、slab、percpu
+![image-20210930204613040](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210930204613040.png)
 
-vmalloc系列的函数最终会调用`__vmalloc_node_range`函数，该函数的参数当中就存在caller（返回地址），因此实际的统计只需要加一行，测试统计发现只有很少量的模块会使用到vmalloc系列函数因此0001-9-15.patch当中没有加入vmalloc
+free后为0
 
-#### slab函数图
+![image-20210930204910521](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210930204910521.png)
 
-![image-20210915160044184](./img/image-20210915160044184.png)
+**kmem_cache_node系列函数测试**
 
-#### buddy函数图
+分配一次为32字节
 
-##### 图1
+![image-20210930205025040](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210930205025040.png)
 
-![image-20210915160149629](./img/image-20210915160149629.png)
+free后为0
 
-##### 图2
+![image-20210930205104101](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210930205104101.png)
 
-![image-20210915160203145](./img/image-20210915160203145.png)
+**kmem_cache_alloc_bulk函数测试**
 
-#### vmalloc函数图
+kmem_cache_alloc_bulk可以进行批量内存分配，测试分配20个的情况，共统计了640字节
 
-![image-20210915161246004](./img/image-20210915161246004.png)
+![image-20210930205214039](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210930205214039.png)
+
+free后为0
+
+![image-20210930205353417](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210930205353417.png)
+
+**buddy页分配测试**
+
+alloc_pages分配16页
+
+alloc_pages_node分配8页
+
+get_zeroed_page分配1页
+
+__get_free_pages分配4页
+
+alloc_pages_exact分配3页
+
+共计：32页
+
+![image-20210930210138261](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210930210138261.png)
+
+free后为0
+
+![image-20210930210204059](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210930210204059.png)
+
+**percpu分配测试**
+
+![image-20210930210312715](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210930210312715.png)
+
+free后为0
+
+![image-20210930210346363](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210930210346363.png)
+
+**mempool分配测试**
+
+使用mempool分别创建一个slab_pool、一个page_pool以及两个kmalloc_pool
+
+slab_pool分配32字节
+
+page_pool分配8页
+
+第一个kmalloc_pool分配32字节
+
+第二个kmalloc_pool分配4字节
+
+共计：64字节12页
+
+![image-20210930212117050](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210930212117050.png)
+
+free后均为0
+
+![image-20210930212400193](C:\Users\cyfan\AppData\Roaming\Typora\typora-user-images\image-20210930212400193.png)
 
 #### 参与贡献
 
