@@ -23,7 +23,7 @@ old-patch文件夹内存放中期考核成果0001-statis.patch，以及9月15日
 
 使用内核模块内存统计功能需要开启mm/Kconfig下的Kmalloc debug的配置选项
 
-![image-20210930191802163](.\img\image-20210930191802163.png)
+![image-20210930191802163](./img/image-20210930191802163.png)
 
 开启后会在sysfs下为每个模块（非built-in模块）创建一个usedmemory文件
 
