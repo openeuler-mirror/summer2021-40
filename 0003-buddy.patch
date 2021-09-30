@@ -1,0 +1,195 @@
+From 5499fe3d882bdcd3c322a6d4b680f1d9f23e122e Mon Sep 17 00:00:00 2001
+From: jiax <jiaxgong@163.com>
+Date: Tue, 28 Sep 2021 20:18:42 +0800
+Subject: [PATCH 3/5] buddy
+
+---
+ mm/mempolicy.c  |  6 +++++
+ mm/page_alloc.c | 67 +++++++++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 71 insertions(+), 2 deletions(-)
+
+diff --git a/mm/mempolicy.c b/mm/mempolicy.c
+index 3a835f96c8fe..90c7b594eee5 100644
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -2213,6 +2213,9 @@ alloc_pages_vma(gfp_t gfp, int order, struct vm_area_struct *vma,
+ 	mark_vma_cdm(nmask, page, vma);
+ 	mpol_cond_put(pol);
+ out:
++#ifdef CONFIG_DEBUG_KMALLOC
++	record_to_sysfs_page((unsigned long)_RET_IP_, (unsigned long)page_address(page), 1<<order);
++#endif
+ 	return page;
+ }
+ 
+@@ -2250,6 +2253,9 @@ struct page *alloc_pages_current(gfp_t gfp, unsigned order)
+ 				policy_node(gfp, pol, numa_node_id()),
+ 				policy_nodemask(gfp, pol));
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++	record_to_sysfs_page((unsigned long)_RET_IP_, (unsigned long)page_address(page), 1<<order);
++#endif
+ 	return page;
+ }
+ EXPORT_SYMBOL(alloc_pages_current);
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index d2012e07e529..8e3a584f73b5 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -4549,6 +4549,9 @@ __alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order, int preferred_nid,
+ 
+ 	trace_mm_page_alloc(page, order, alloc_mask, ac.migratetype);
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++	record_to_sysfs_page((unsigned long)_RET_IP_, (unsigned long)page_address(page), 1<<order);
++#endif
+ 	return page;
+ }
+ EXPORT_SYMBOL(__alloc_pages_nodemask);
+@@ -4565,13 +4568,20 @@ unsigned long __get_free_pages(gfp_t gfp_mask, unsigned int order)
+ 	page = alloc_pages(gfp_mask & ~__GFP_HIGHMEM, order);
+ 	if (!page)
+ 		return 0;
++#ifdef CONFIG_DEBUG_KMALLOC
++	record_to_sysfs_page((unsigned long)_RET_IP_, (unsigned long)page_address(page), 1<<order);
++#endif
+ 	return (unsigned long) page_address(page);
+ }
+ EXPORT_SYMBOL(__get_free_pages);
+ 
+ unsigned long get_zeroed_page(gfp_t gfp_mask)
+ {
+-	return __get_free_pages(gfp_mask | __GFP_ZERO, 0);
++	unsigned long addr = __get_free_pages(gfp_mask | __GFP_ZERO, 0);
++#ifdef CONFIG_DEBUG_KMALLOC
++	record_to_sysfs_page((unsigned long)_RET_IP_, addr, 1);
++#endif
++	return addr;
+ }
+ EXPORT_SYMBOL(get_zeroed_page);
+ 
+@@ -4585,6 +4595,9 @@ static inline void free_the_page(struct page *page, unsigned int order)
+ 
+ void __free_pages(struct page *page, unsigned int order)
+ {
++#ifdef CONFIG_DEBUG_KMALLOC
++	free_mem_record_page((unsigned long)_RET_IP_, (unsigned long)page_address(page), 1<<order);
++#endif
+ 	if (put_page_testzero(page))
+ 		free_the_page(page, order);
+ 	else if (!PageHead(page))
+@@ -4597,6 +4610,9 @@ void free_pages(unsigned long addr, unsigned int order)
+ {
+ 	if (addr != 0) {
+ 		VM_BUG_ON(!virt_addr_valid((void *)addr));
++#ifdef CONFIG_DEBUG_KMALLOC
++		free_mem_record_page((unsigned long)_RET_IP_, addr, 1<<order);
++#endif
+ 		__free_pages(virt_to_page((void *)addr), order);
+ 	}
+ }
+@@ -4639,6 +4655,10 @@ void __page_frag_cache_drain(struct page *page, unsigned int count)
+ {
+ 	VM_BUG_ON_PAGE(page_ref_count(page) == 0, page);
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++	free_mem_record_page((unsigned long)_RET_IP_, (unsigned long)page_address(page), 1<<compound_order(page));
++#endif
++
+ 	if (page_ref_sub_and_test(page, count))
+ 		free_the_page(page, compound_order(page));
+ }
+@@ -4710,6 +4730,10 @@ void page_frag_free(void *addr)
+ {
+ 	struct page *page = virt_to_head_page(addr);
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++	free_mem_record_page((unsigned long)_RET_IP_, (unsigned long)page_address(page), 1<<compound_order(page));
++#endif
++
+ 	if (unlikely(put_page_testzero(page)))
+ 		free_the_page(page, compound_order(page));
+ }
+@@ -4748,12 +4772,27 @@ void *alloc_pages_exact(size_t size, gfp_t gfp_mask)
+ {
+ 	unsigned int order = get_order(size);
+ 	unsigned long addr;
++#ifdef CONFIG_DEBUG_KMALLOC
++	void* ret;
++	unsigned long end, caller_address;
++#endif
+ 
+ 	if (WARN_ON_ONCE(gfp_mask & __GFP_COMP))
+ 		gfp_mask &= ~__GFP_COMP;
+ 
+ 	addr = __get_free_pages(gfp_mask, order);
++#ifdef CONFIG_DEBUG_KMALLOC
++	ret = make_alloc_exact(addr, order, size);
++	end = addr + PAGE_ALIGN(size);
++	caller_address = (unsigned long)_RET_IP_;
++	while (addr < end) {
++		record_to_sysfs_page(caller_address, addr, 1);
++		addr += PAGE_SIZE;
++	}
++	return ret;
++#else
+ 	return make_alloc_exact(addr, order, size);
++#endif
+ }
+ EXPORT_SYMBOL(alloc_pages_exact);
+ 
+@@ -4771,6 +4810,10 @@ void * __meminit alloc_pages_exact_nid(int nid, size_t size, gfp_t gfp_mask)
+ {
+ 	unsigned int order = get_order(size);
+ 	struct page *p;
++#ifdef CONFIG_DEBUG_KMALLOC
++	void *ret;
++	unsigned long addr, end, caller_address;
++#endif
+ 
+ 	if (WARN_ON_ONCE(gfp_mask & __GFP_COMP))
+ 		gfp_mask &= ~__GFP_COMP;
+@@ -4778,7 +4821,19 @@ void * __meminit alloc_pages_exact_nid(int nid, size_t size, gfp_t gfp_mask)
+ 	p = alloc_pages_node(nid, gfp_mask, order);
+ 	if (!p)
+ 		return NULL;
++#ifdef CONFIG_DEBUG_KMALLOC
++	ret = make_alloc_exact((unsigned long)page_address(p), order, size);
++	addr = (unsigned long)page_address(p);
++	end = addr + PAGE_ALIGN(size);
++	caller_address = (unsigned long)_RET_IP_;
++	while (addr < end) {
++		record_to_sysfs_page(caller_address, addr, 1);
++		addr += PAGE_SIZE;
++	}
++	return ret;
++#else
+ 	return make_alloc_exact((unsigned long)page_address(p), order, size);
++#endif
+ }
+ 
+ /**
+@@ -4792,11 +4847,19 @@ void free_pages_exact(void *virt, size_t size)
+ {
+ 	unsigned long addr = (unsigned long)virt;
+ 	unsigned long end = addr + PAGE_ALIGN(size);
+-
++#ifdef CONFIG_DEBUG_KMALLOC
++	unsigned long caller_address = (unsigned long)_RET_IP_;
+ 	while (addr < end) {
+ 		free_page(addr);
++		free_mem_record_page(caller_address, addr, 1);
+ 		addr += PAGE_SIZE;
+ 	}
++#else
++	while (addr < end) {
++		free_page(addr);
++		addr += PAGE_SIZE;
++	}
++#endif
+ }
+ EXPORT_SYMBOL(free_pages_exact);
+ 
+-- 
+2.27.0
+

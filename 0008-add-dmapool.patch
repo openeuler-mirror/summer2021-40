@@ -1,0 +1,57 @@
+From 22b9a3f1f0cfdd545cbbbd02062bc7a2531ef08f Mon Sep 17 00:00:00 2001
+From: jiax <jiaxgong@163.com>
+Date: Thu, 30 Sep 2021 22:01:35 +0800
+Subject: [PATCH 8/8] add dmapool
+
+---
+ kernel/statis_memory.c | 8 ++++++--
+ mm/dmapool.c           | 7 +++++++
+ 2 files changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/statis_memory.c b/kernel/statis_memory.c
+index ac2ce0023f28..ea69382f5413 100644
+--- a/kernel/statis_memory.c
++++ b/kernel/statis_memory.c
+@@ -87,8 +87,12 @@ void record_to_sysfs_type(unsigned long caller_address, void* x, size_t size, ca
+     unsigned long val = (unsigned long)x;
+     unsigned long inc_val = (unsigned long)size;
+     struct module *mod = __module_text_address(caller_address);
+-    if(mod && val)
+-        __do_record(&mod->mkobj.slab_t, val, inc_val);
++    if(mod && val){
++        if(cf_type == SLAB)
++            __do_record(&mod->mkobj.slab_t, val, inc_val);
++        else if(cf_type == DMA_POOL)
++            __do_record(&mod->mkobj.dmapool_t, val, inc_val);
++    }
+ }
+ EXPORT_SYMBOL(record_to_sysfs_type);
+ 
+diff --git a/mm/dmapool.c b/mm/dmapool.c
+index 6d4b97e7e9e9..9c8e4469d854 100644
+--- a/mm/dmapool.c
++++ b/mm/dmapool.c
+@@ -382,6 +382,9 @@ void *dma_pool_alloc(struct dma_pool *pool, gfp_t mem_flags,
+ 	if (mem_flags & __GFP_ZERO)
+ 		memset(retval, 0, pool->size);
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++	record_to_sysfs_type((unsigned long)_RET_IP_, retval, pool->size, DMA_POOL);
++#endif
+ 	return retval;
+ }
+ EXPORT_SYMBOL(dma_pool_alloc);
+@@ -461,6 +464,10 @@ void dma_pool_free(struct dma_pool *pool, void *vaddr, dma_addr_t dma)
+ 	memset(vaddr, POOL_POISON_FREED, pool->size);
+ #endif
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++	free_mem_record_type((unsigned long)_RET_IP_, vaddr, pool->size, DMA_POOL);
++#endif
++
+ 	page->in_use--;
+ 	*(int *)vaddr = page->offset;
+ 	page->offset = offset;
+-- 
+2.27.0
+

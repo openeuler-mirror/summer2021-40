@@ -1,0 +1,201 @@
+From 85ce54b57aa1efdaf1fbb362e1f7be343670d2d4 Mon Sep 17 00:00:00 2001
+From: jiax <jiaxgong@163.com>
+Date: Thu, 30 Sep 2021 14:55:02 +0800
+Subject: [PATCH 5/5] add split_page krealloc
+
+---
+ include/linux/statis_memory.h |  4 ----
+ kernel/statis_memory.c        | 12 +++++-----
+ mm/page_alloc.c               | 14 +++++++++++-
+ mm/slab_common.c              | 42 ++++++++++++++++++++++++++---------
+ 4 files changed, 51 insertions(+), 21 deletions(-)
+
+diff --git a/include/linux/statis_memory.h b/include/linux/statis_memory.h
+index 509366f30220..869315d94b83 100644
+--- a/include/linux/statis_memory.h
++++ b/include/linux/statis_memory.h
+@@ -29,8 +29,4 @@ void record_to_sysfs_percpu(unsigned long caller_address, void __percpu *x, size
+ 
+ void free_mem_record_percpu(unsigned long caller_address, void __percpu *x, size_t size);
+ 
+-void record_to_sysfs_dmapool(unsigned long caller_address, void *x, size_t size);
+-
+-void free_mem_record_dmapool(unsigned long caller_address, void *x, size_t size);
+-
+ #endif
+diff --git a/kernel/statis_memory.c b/kernel/statis_memory.c
+index a428db56f841..ac2ce0023f28 100644
+--- a/kernel/statis_memory.c
++++ b/kernel/statis_memory.c
+@@ -87,7 +87,7 @@ void record_to_sysfs_type(unsigned long caller_address, void* x, size_t size, ca
+     unsigned long val = (unsigned long)x;
+     unsigned long inc_val = (unsigned long)size;
+     struct module *mod = __module_text_address(caller_address);
+-    if(mod != NULL)
++    if(mod && val)
+         __do_record(&mod->mkobj.slab_t, val, inc_val);
+ }
+ EXPORT_SYMBOL(record_to_sysfs_type);
+@@ -95,7 +95,7 @@ EXPORT_SYMBOL(record_to_sysfs_type);
+ void record_to_sysfs_page(unsigned long caller_address, unsigned long addr, unsigned long cnt)
+ {
+     struct module *mod = __module_text_address(caller_address);
+-    if(mod != NULL)
++    if(mod && addr)
+         __do_record(&mod->mkobj.page_t, addr, cnt);
+ }
+ EXPORT_SYMBOL(record_to_sysfs_page);
+@@ -105,7 +105,7 @@ void record_to_sysfs_percpu(unsigned long caller_address, void __percpu *x, size
+     unsigned long val = (unsigned long)x;
+     unsigned long inc_val = (unsigned long)size;
+     struct module *mod = __module_text_address(caller_address);
+-    if(mod != NULL)
++    if(mod && val)
+         __do_record(&mod->mkobj.percpu_t, val, inc_val);
+ }
+ EXPORT_SYMBOL(record_to_sysfs_percpu);
+@@ -115,7 +115,7 @@ void free_mem_record_type(unsigned long caller_address, void* x, size_t size, ca
+     unsigned long val = (unsigned long)x;
+     unsigned long dec_val = (unsigned long)size;
+     struct module *mod = __module_text_address(caller_address);
+-    if(mod != NULL)
++    if(mod && val)
+         __do_record_free(&mod->mkobj.slab_t, val, dec_val);
+ }
+ EXPORT_SYMBOL(free_mem_record_type);
+@@ -123,7 +123,7 @@ EXPORT_SYMBOL(free_mem_record_type);
+ void free_mem_record_page(unsigned long caller_address, unsigned long addr, unsigned long cnt)
+ {
+     struct module *mod = __module_text_address(caller_address);
+-    if(mod != NULL)
++    if(mod && addr)
+         __do_record_free(&mod->mkobj.page_t, addr, cnt);
+ }
+ EXPORT_SYMBOL(free_mem_record_page);
+@@ -133,7 +133,7 @@ void free_mem_record_percpu(unsigned long caller_address, void __percpu *x, size
+     unsigned long val = (unsigned long)x;
+     unsigned long dec_val = (unsigned long)size;
+     struct module *mod = __module_text_address(caller_address);
+-    if(mod != NULL)
++    if(mod && val)
+         __do_record_free(&mod->mkobj.percpu_t, val, dec_val);
+ }
+ EXPORT_SYMBOL(free_mem_record_percpu);
+\ No newline at end of file
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 8e3a584f73b5..930801c29762 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -2934,6 +2934,13 @@ void free_unref_page_list(struct list_head *list)
+ void split_page(struct page *page, unsigned int order)
+ {
+ 	int i;
++#ifdef CONFIG_DEBUG_KMALLOC
++	unsigned long caller_address = (unsigned long)_RET_IP_;
++	unsigned long page_start = (unsigned long)page_address(page);
++	free_mem_record_page(caller_address, (unsigned long)page_address(page), 1<<order);
++	for (i = 0; i < (1 << order); i++)
++		record_to_sysfs_page(caller_address, page_start+i*PAGE_SIZE, 1);
++#endif
+ 
+ 	VM_BUG_ON_PAGE(PageCompound(page), page);
+ 	VM_BUG_ON_PAGE(!page_count(page), page);
+@@ -7275,7 +7282,9 @@ unsigned long free_reserved_area(void *start, void *end, int poison, char *s)
+ 		direct_map_addr = page_address(page);
+ 		if ((unsigned int)poison <= 0xFF)
+ 			memset(direct_map_addr, poison, PAGE_SIZE);
+-
++#ifdef CONFIG_DEBUG_KMALLOC
++		free_mem_record_page((unsigned long)_RET_IP_, (unsigned long)page_address(page), 1);
++#endif
+ 		free_reserved_page(page);
+ 	}
+ 
+@@ -7290,6 +7299,9 @@ EXPORT_SYMBOL(free_reserved_area);
+ #ifdef	CONFIG_HIGHMEM
+ void free_highmem_page(struct page *page)
+ {
++#ifdef CONFIG_DEBUG_KMALLOC
++	free_mem_record_page((unsigned long)_RET_IP_, (unsigned long)page_address(page), 1);
++#endif
+ 	__free_reserved_page(page);
+ 	totalram_pages++;
+ 	page_zone(page)->managed_pages++;
+diff --git a/mm/slab_common.c b/mm/slab_common.c
+index 8ba0cb557633..d0c36649f5f3 100644
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@ -1592,10 +1592,31 @@ static __always_inline void *__do_krealloc(const void *p, size_t new_size,
+ 
+ 	ret = kmalloc_track_caller(new_size, flags);
+ 	if (ret && p)
+-		memcpy(ret, p, ks);
+-
++		memcpy(ret, p, ks);	
++#ifdef CONFIG_DEBUG_KMALLOC
++	if(new_size > KMALLOC_MAX_CACHE_SIZE)
++		record_to_sysfs_page((unsigned long)_RET_IP_, (unsigned long)ret, 1<<get_order(new_size));
++	else
++		record_to_sysfs_type((unsigned long)_RET_IP_, ret, ksize(ret), SLAB);
++#endif
+ 	return ret;
+ }
++#ifdef CONFIG_DEBUG_KMALLOC
++static inline void __do_statis_free(const void* x)
++{
++	void *mem = (void*)x;
++	struct page *page;
++	unsigned long caller_address;
++	if (unlikely(ZERO_OR_NULL_PTR(mem)))
++		return;
++	page = virt_to_head_page(mem);
++	caller_address = (unsigned long)_RET_IP_;
++	if (unlikely(!PageSlab(page)))
++		free_mem_record_page(caller_address, (unsigned long)page_address(page), 1<<compound_order(page));
++	else
++		free_mem_record_type(caller_address, mem, ksize(x), SLAB);
++}
++#endif
+ /**
+  * __krealloc - like krealloc() but don't free @p.
+  * @p: object to reallocate memory for.
+@@ -1631,14 +1652,20 @@ void *krealloc(const void *p, size_t new_size, gfp_t flags)
+ 	void *ret;
+ 
+ 	if (unlikely(!new_size)) {
++#ifdef CONFIG_DEBUG_KMALLOC
++		__do_statis_free(p);
++#endif
+ 		kfree(p);
+ 		return ZERO_SIZE_PTR;
+ 	}
+ 
+ 	ret = __do_krealloc(p, new_size, flags);
+-	if (ret && p != ret)
++	if (ret && p != ret){
++#ifdef CONFIG_DEBUG_KMALLOC
++		__do_statis_free(p);
++#endif	
+ 		kfree(p);
+-
++	}
+ 	return ret;
+ }
+ EXPORT_SYMBOL(krealloc);
+@@ -1663,12 +1690,7 @@ void kzfree(const void *p)
+ 		return;
+ 	ks = ksize(mem);
+ #ifdef CONFIG_DEBUG_KMALLOC
+-	struct page *page = virt_to_head_page(mem);
+-	unsigned long caller_address = (unsigned long)_RET_IP_;
+-	if (unlikely(!PageSlab(page)))
+-		free_mem_record_page(caller_address, (unsigned long)page_address(page), 1<<compound_order(page));
+-	else
+-		free_mem_record_type(caller_address, mem, ks, SLAB);
++	__do_statis_free(mem);
+ #endif
+ 	memzero_explicit(mem, ks);
+ 	kfree(mem);
+-- 
+2.27.0
+

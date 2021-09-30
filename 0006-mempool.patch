@@ -1,0 +1,79 @@
+From 24dc2c7974a4a6d52a24b6ee0da259d8168c144f Mon Sep 17 00:00:00 2001
+From: jiax <jiaxgong@163.com>
+Date: Thu, 30 Sep 2021 14:58:12 +0800
+Subject: [PATCH 6/6] mempool
+
+fix a bug in mempool statis
+---
+ mm/mempool.c | 40 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/mm/mempool.c b/mm/mempool.c
+index 0ef8cc8d1602..39b7918c09ab 100644
+--- a/mm/mempool.c
++++ b/mm/mempool.c
+@@ -352,6 +352,37 @@ int mempool_resize(mempool_t *pool, int new_min_nr)
+ }
+ EXPORT_SYMBOL(mempool_resize);
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++static inline void __do_statis_alloc_mempool(void* element, mempool_t* pool, gfp_t gfp_mask)
++{
++	struct page *page;
++	unsigned long caller_address = (unsigned long)_RET_IP_;
++
++	if (unlikely(ZERO_OR_NULL_PTR(element)))
++		return;
++	
++	if(pool->alloc == mempool_alloc_pages){
++		int order = (int)(long)pool->pool_data;
++		page = (struct page*)element;
++		record_to_sysfs_page(caller_address, (unsigned long)page_address(page), 1<<order);
++	}
++	else if(pool->alloc == mempool_alloc_slab){
++		struct kmem_cache *mem = pool->pool_data;
++		record_to_sysfs_type(caller_address, element, mem->object_size, SLAB);
++	}
++	else if(pool->alloc == mempool_kmalloc){
++		size_t size = (size_t)pool->pool_data;
++		page = virt_to_head_page(element);
++		if (unlikely(!PageSlab(page)))
++			record_to_sysfs_page(caller_address, (unsigned long)element, 1<<get_order(size));
++		else{
++			struct kmem_cache *s = kmalloc_slab(size, gfp_mask);
++			record_to_sysfs_type(caller_address, element, s->object_size, SLAB);
++		}
++	}
++}
++#endif
++
+ /**
+  * mempool_alloc - allocate an element from a specific memory pool
+  * @pool:      pointer to the memory pool which was allocated via
+@@ -383,8 +414,12 @@ void *mempool_alloc(mempool_t *pool, gfp_t gfp_mask)
+ repeat_alloc:
+ 
+ 	element = pool->alloc(gfp_temp, pool->pool_data);
+-	if (likely(element != NULL))
++	if (likely(element != NULL)){
++#ifdef CONFIG_DEBUG_KMALLOC
++		__do_statis_alloc_mempool(element, pool, gfp_temp);
++#endif
+ 		return element;
++	}
+ 
+ 	spin_lock_irqsave(&pool->lock, flags);
+ 	if (likely(pool->curr_nr)) {
+@@ -397,6 +432,9 @@ void *mempool_alloc(mempool_t *pool, gfp_t gfp_mask)
+ 		 * for debugging.
+ 		 */
+ 		kmemleak_update_trace(element);
++#ifdef CONFIG_DEBUG_KMALLOC
++		__do_statis_alloc_mempool(element, pool, gfp_mask);
++#endif
+ 		return element;
+ 	}
+ 
+-- 
+2.27.0
+

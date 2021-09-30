@@ -1,0 +1,658 @@
+-----------------ebtables/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------vmwgfx/usedmemory--------------
+Record page:4
+Records:1758
+Slab:370kb
+Pages:64
+Percpu:0
+dmapool:2232512
+-----------------syscopyarea/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------ac97_bus/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------ip6table_filter/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------ata_piix/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------xt_conntrack/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------nf_conntrack/usedmemory--------------
+Record page:1
+Records:135
+Slab:31744bytes
+Pages:0
+Percpu:216
+dmapool:0
+-----------------mptbase/usedmemory--------------
+Record page:1
+Records:4
+Slab:5184bytes
+Pages:4
+Percpu:0
+dmapool:0
+-----------------btrtl/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------ecdh_generic/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------ip6table_raw/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------iptable_filter/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------nfnetlink/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------soundcore/usedmemory--------------
+Record page:1
+Records:2
+Slab:128bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------snd_seq_device/usedmemory--------------
+Record page:1
+Records:1
+Slab:2048bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------iptable_security/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------ip6table_nat/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------mptspi/usedmemory--------------
+Record page:1
+Records:18
+Slab:1568bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------nf_nat/usedmemory--------------
+Record page:1
+Records:10
+Slab:4352bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------drm_kms_helper/usedmemory--------------
+Record page:1
+Records:16
+Slab:2624bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------vmw_vmci/usedmemory--------------
+Record page:1
+Records:12
+Slab:2016bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------nls_utf8/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------bridge/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------ip6t_rpfilter/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------sysimgblt/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------cdrom/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------mbcache/usedmemory--------------
+Record page:1
+Records:17
+Slab:25768bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------nf_defrag_ipv6/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------ebtable_nat/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------vsock/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------ebtable_filter/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------nf_nat_ipv6/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------dm_region_hash/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------sd_mod/usedmemory--------------
+Record page:1
+Records:1
+Slab:2048bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------nf_defrag_ipv4/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------e1000/usedmemory--------------
+Record page:1
+Records:11
+Slab:4736bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------ata_generic/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------scsi_transport_spi/usedmemory--------------
+Record page:1
+Records:1
+Slab:512bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------libcrc32c/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------vmw_balloon/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:1
+Percpu:0
+dmapool:0
+-----------------nf_nat_ipv4/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------nf_reject_ipv6/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------dm_log/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------serio_raw/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------snd_timer/usedmemory--------------
+Record page:1
+Records:8
+Slab:6720bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------ghash_clmulni_intel/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------rfkill/usedmemory--------------
+Record page:1
+Records:3
+Slab:2240bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------btintel/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------joydev/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------nf_reject_ipv4/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------snd_ac97_codec/usedmemory--------------
+Record page:1
+Records:2
+Slab:2176bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------ip6_tables/usedmemory--------------
+Record page:1
+Records:5
+Slab:7168bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------bluetooth/usedmemory--------------
+Record page:1
+Records:16
+Slab:25024bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------btbcm/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------fuse/usedmemory--------------
+Record page:1
+Records:9
+Slab:1504bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------fb_sys_fops/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------bnep/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------btusb/usedmemory--------------
+Record page:1
+Records:3
+Slab:4112bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------ext4/usedmemory--------------
+Record page:258
+Records:131442
+Slab:105862kb
+Pages:0
+Percpu:600
+dmapool:0
+-----------------ipt_REJECT/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------ebtable_broute/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------sysfillrect/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------ip_set/usedmemory--------------
+Record page:1
+Records:6
+Slab:12288bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------llc/usedmemory--------------
+Record page:1
+Records:1
+Slab:2048bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------mptscsih/usedmemory--------------
+Record page:1
+Records:1
+Slab:4096bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------iptable_raw/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------crct10dif_pclmul/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------snd_pcm/usedmemory--------------
+Record page:1
+Records:10
+Slab:14480bytes
+Pages:2
+Percpu:0
+dmapool:0
+-----------------snd/usedmemory--------------
+Record page:1
+Records:102
+Slab:19840bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------dm_mod/usedmemory--------------
+Record page:1
+Records:15
+Slab:2064bytes
+Pages:0
+Percpu:48
+dmapool:0
+-----------------crc32c_intel/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------libata/usedmemory--------------
+Record page:1
+Records:3
+Slab:2304bytes
+Pages:20
+Percpu:0
+dmapool:0
+-----------------sg/usedmemory--------------
+Record page:1
+Records:2
+Slab:384bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------ip_tables/usedmemory--------------
+Record page:1
+Records:5
+Slab:6144bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------iptable_nat/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------ttm/usedmemory--------------
+Record page:1
+Records:40
+Slab:14408bytes
+Pages:4406
+Percpu:0
+dmapool:0
+-----------------ip6table_mangle/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------isofs/usedmemory--------------
+Record page:1
+Records:13
+Slab:8352bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------dm_mirror/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------i2c_piix4/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------rfcomm/usedmemory--------------
+Record page:1
+Records:3
+Slab:704bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------vmw_vsock_vmci_transport/usedmemory--------------
+Record page:1
+Records:1
+Slab:192bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------ip6table_security/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------ip6t_REJECT/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------stp/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------crc32_pclmul/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------pcspkr/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------snd_rawmidi/usedmemory--------------
+Record page:1
+Records:3
+Slab:2304bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------iptable_mangle/usedmemory--------------
+Record page:0
+Records:0
+Slab:0bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------snd_ens1371/usedmemory--------------
+Record page:1
+Records:1
+Slab:256bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------sr_mod/usedmemory--------------
+Record page:1
+Records:1
+Slab:192bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------jbd2/usedmemory--------------
+Record page:1
+Records:46
+Slab:46968bytes
+Pages:0
+Percpu:0
+dmapool:0
+-----------------drm/usedmemory--------------
+Record page:6
+Records:2967
+Slab:583kb
+Pages:0
+Percpu:0
+dmapool:0

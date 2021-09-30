@@ -1,0 +1,49 @@
+From c9e3ed93932cfdc6c54a53019998036d80d84461 Mon Sep 17 00:00:00 2001
+From: jiax <jiaxgong@163.com>
+Date: Thu, 30 Sep 2021 22:00:34 +0800
+Subject: [PATCH 7/8] update
+
+---
+ kernel/params.c | 19 +++++--------------
+ 1 file changed, 5 insertions(+), 14 deletions(-)
+
+diff --git a/kernel/params.c b/kernel/params.c
+index c9a4a7d82afb..bf2bd0b3d7ff 100644
+--- a/kernel/params.c
++++ b/kernel/params.c
+@@ -922,27 +922,18 @@ static void __init version_sysfs_builtin(void)
+ ssize_t __module_usedmemory_show(struct module_attribute * mattr,
+ 				     struct module_kobject *mk, char* buf)
+ {
+-	int record_pages = 0;
+-	int all_elements = 0;
+-	struct alloc_addr_list *addr_list = mk->slab_t.addr_list;
+-
++	
+ 	unsigned long used_slab = atomic64_read(&mk->slab_t.used);
+ 	unsigned long used_pages = atomic64_read(&mk->page_t.used);
+ 	unsigned long used_percpu = atomic64_read(&mk->percpu_t.used);
+ 	unsigned long used_dmapool = atomic64_read(&mk->dmapool_t.used);
+-
+-	while(addr_list){
+-		record_pages++;
+-		all_elements += atomic_read(&addr_list->page_elements);
+-		addr_list = addr_list->next;
+-	}
+ 	
+ 	if(used_slab >= 1024*100)
+-		return scnprintf(buf, PAGE_SIZE, "Record page:%d\nRecords:%d\nSlab:%ldkb\nPages:%ld\nPercpu:%ld\ndmapool:%ld\n",\
+-			record_pages, all_elements, used_slab/1024, used_pages, used_percpu, used_dmapool);
++		return scnprintf(buf, PAGE_SIZE, "Slab:%ldkb\nPages:%ld\nPercpu:%ld\ndmapool:%ld\n",\
++			used_slab/1024, used_pages, used_percpu, used_dmapool);
+ 	else
+-		return scnprintf(buf, PAGE_SIZE, "Record page:%d\nRecords:%d\nSlab:%ldbytes\nPages:%ld\nPercpu:%ld\ndmapool:%ld\n",\
+-			record_pages, all_elements, used_slab, used_pages, used_percpu, used_dmapool);
++		return scnprintf(buf, PAGE_SIZE, "Slab:%ldbytes\nPages:%ld\nPercpu:%ld\ndmapool:%ld\n",\
++			used_slab, used_pages, used_percpu, used_dmapool);
+ }
+ 
+ #endif
+-- 
+2.27.0
+
