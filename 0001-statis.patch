@@ -1,0 +1,2685 @@
+From 103390ccc2cbfe22a25814f31d766a4e61583cf4 Mon Sep 17 00:00:00 2001
+From: jiax <jiaxgong@163.com>
+Date: Fri, 13 Aug 2021 21:43:49 +0800
+Subject: [PATCH] statis
+
+---
+ block/bio.c                    | 554 ++++++++++++++++++++++++++++++++-
+ drivers/md/dm-bufio.c          |   3 +
+ drivers/md/dm-snap.c           |   5 +-
+ drivers/md/dm-uevent.c         |   1 +
+ drivers/md/raid5-ppl.c         |   2 +
+ drivers/md/raid5.c             |   1 +
+ include/asm-generic/sections.h |   3 +
+ include/linux/mempool.h        |   9 +
+ include/linux/module.h         |  29 ++
+ include/linux/slab.h           | 394 ++++++++++++++++++++++-
+ init/Kconfig                   |   2 +-
+ kernel/Makefile                |   3 +
+ kernel/module.c                |  25 ++
+ kernel/params.c                |  68 ++++
+ mm/Kconfig                     |   6 +
+ mm/mempool.c                   | 152 +++++++++
+ mm/slab_common.c               |  85 ++++-
+ mm/slub.c                      | 476 +++++++++++++++++++++++++++-
+ 18 files changed, 1805 insertions(+), 13 deletions(-)
+
+diff --git a/block/bio.c b/block/bio.c
+index da05350dfba2..998729af6a70 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -248,7 +248,8 @@ void bio_uninit(struct bio *bio)
+ }
+ EXPORT_SYMBOL(bio_uninit);
+ 
+-static void bio_free(struct bio *bio)
++#ifdef CONFIG_DEBUG_KMALLOC
++static void bio_free(struct bio *bio, unsigned long caller_address)
+ {
+ 	struct bio_set *bs = bio->bi_pool;
+ 	void *p;
+@@ -263,7 +264,29 @@ static void bio_free(struct bio *bio)
+ 		 */
+ 		p = bio;
+ 		p -= bs->front_pad;
++		mempool_free(p, &bs->bio_pool);
++		//printk(KERN_DEBUG "mempool_free\n");
++	} else {
++		/* Bio was allocated by bio_kmalloc() */
++		kfree(bio);
++	}
++}
++#else
++static void bio_free(struct bio *bio)
++{
++	struct bio_set *bs = bio->bi_pool;
++	void *p;
++
++	bio_uninit(bio);
++
++	if (bs) {
++		bvec_free(&bs->bvec_pool, bio->bi_io_vec, BVEC_POOL_IDX(bio));
+ 
++		/*
++		 * If we have front padding, adjust the bio pointer before freeing
++		 */
++		p = bio;
++		p -= bs->front_pad;
+ 		mempool_free(p, &bs->bio_pool);
+ 	} else {
+ 		/* Bio was allocated by bio_kmalloc() */
+@@ -271,6 +294,7 @@ static void bio_free(struct bio *bio)
+ 	}
+ }
+ 
++#endif
+ /*
+  * Users of this function have their own bio allocation. Subsequently,
+  * they must remember to pair any call to bio_init() with bio_uninit()
+@@ -435,6 +459,117 @@ static void punt_bios_to_rescuer(struct bio_set *bs)
+  *   RETURNS:
+  *   Pointer to new bio on success, NULL on failure.
+  */
++#ifdef CONFIG_DEBUG_KMALLOC
++struct bio *bio_alloc_bioset_memhook(gfp_t gfp_mask, unsigned int nr_iovecs,
++			     struct bio_set *bs, unsigned long caller_address, call_function_t cf_type)
++{
++	gfp_t saved_gfp = gfp_mask;
++	unsigned front_pad;
++	unsigned inline_vecs;
++	struct bio_vec *bvl = NULL;
++	struct bio *bio;
++	void *p;
++	//struct module* mod;
++
++	if (!bs) {
++		if (nr_iovecs > UIO_MAXIOV)
++			return NULL;
++
++		p = kmalloc_memhook(sizeof(struct bio) +
++			    nr_iovecs * sizeof(struct bio_vec),
++			    gfp_mask, caller_address, cf_type);
++		front_pad = 0;
++		inline_vecs = nr_iovecs;
++	} else {
++		/* should not use nobvec bioset for nr_iovecs > 0 */
++		if (WARN_ON_ONCE(!mempool_initialized(&bs->bvec_pool) &&
++				 nr_iovecs > 0))
++			return NULL;
++		/*
++		 * generic_make_request() converts recursion to iteration; this
++		 * means if we're running beneath it, any bios we allocate and
++		 * submit will not be submitted (and thus freed) until after we
++		 * return.
++		 *
++		 * This exposes us to a potential deadlock if we allocate
++		 * multiple bios from the same bio_set() while running
++		 * underneath generic_make_request(). If we were to allocate
++		 * multiple bios (say a stacking block driver that was splitting
++		 * bios), we would deadlock if we exhausted the mempool's
++		 * reserve.
++		 *
++		 * We solve this, and guarantee forward progress, with a rescuer
++		 * workqueue per bio_set. If we go to allocate and there are
++		 * bios on current->bio_list, we first try the allocation
++		 * without __GFP_DIRECT_RECLAIM; if that fails, we punt those
++		 * bios we would be blocking to the rescuer workqueue before
++		 * we retry with the original gfp_flags.
++		 */
++
++		if (current->bio_list &&
++		    (!bio_list_empty(&current->bio_list[0]) ||
++		     !bio_list_empty(&current->bio_list[1])) &&
++		    bs->rescue_workqueue)
++			gfp_mask &= ~__GFP_DIRECT_RECLAIM;
++
++		p = mempool_alloc_memhook(&bs->bio_pool, gfp_mask, caller_address, cf_type);
++		if (!p && gfp_mask != saved_gfp) {
++			punt_bios_to_rescuer(bs);
++			gfp_mask = saved_gfp;
++			p = mempool_alloc_memhook(&bs->bio_pool, gfp_mask, caller_address, cf_type);
++		}
++
++		front_pad = bs->front_pad;
++		inline_vecs = BIO_INLINE_VECS;
++	}
++
++	if (unlikely(!p))
++		return NULL;
++
++	bio = p + front_pad;
++	bio_init(bio, NULL, 0);
++
++	if (nr_iovecs > inline_vecs) {
++		unsigned long idx = 0;
++
++		bvl = bvec_alloc(gfp_mask, nr_iovecs, &idx, &bs->bvec_pool);
++		if (!bvl && gfp_mask != saved_gfp) {
++			punt_bios_to_rescuer(bs);
++			gfp_mask = saved_gfp;
++			bvl = bvec_alloc(gfp_mask, nr_iovecs, &idx, &bs->bvec_pool);
++		}
++
++		if (unlikely(!bvl))
++			goto err_free;
++
++		bio->bi_flags |= idx << BVEC_POOL_OFFSET;
++	} else if (nr_iovecs) {
++		bvl = bio->bi_inline_vecs;
++	}
++
++	bio->bi_pool = bs;
++	bio->bi_max_vecs = nr_iovecs;
++	bio->bi_io_vec = bvl;
++	return bio;
++
++err_free:
++	mempool_free(p, &bs->bio_pool);
++	return NULL;
++}
++EXPORT_SYMBOL(bio_alloc_bioset_memhook);
++
++struct bio *bio_alloc_bioset(gfp_t gfp_mask, unsigned int nr_iovecs,
++			     struct bio_set *bs)
++{
++	unsigned long caller_address;
++	call_function_t cf_type = MEMPOOL_ALLOC;
++
++	caller_address = (unsigned long)_RET_IP_;
++
++	return bio_alloc_bioset_memhook(gfp_mask, nr_iovecs, bs, caller_address, cf_type);
++}
++EXPORT_SYMBOL(bio_alloc_bioset);
++#else
+ struct bio *bio_alloc_bioset(gfp_t gfp_mask, unsigned int nr_iovecs,
+ 			     struct bio_set *bs)
+ {
+@@ -531,6 +666,7 @@ struct bio *bio_alloc_bioset(gfp_t gfp_mask, unsigned int nr_iovecs,
+ 	return NULL;
+ }
+ EXPORT_SYMBOL(bio_alloc_bioset);
++#endif
+ 
+ void zero_fill_bio_iter(struct bio *bio, struct bvec_iter start)
+ {
+@@ -557,8 +693,10 @@ EXPORT_SYMBOL(zero_fill_bio_iter);
+  **/
+ void bio_put(struct bio *bio)
+ {
++	unsigned long caller_address = _RET_IP_;
++
+ 	if (!bio_flagged(bio, BIO_REFFED))
+-		bio_free(bio);
++		bio_free(bio, caller_address);
+ 	else {
+ 		BIO_BUG_ON(!atomic_read(&bio->__bi_cnt));
+ 
+@@ -566,7 +704,7 @@ void bio_put(struct bio *bio)
+ 		 * last put frees it
+ 		 */
+ 		if (atomic_dec_and_test(&bio->__bi_cnt))
+-			bio_free(bio);
++			bio_free(bio,caller_address);
+ 	}
+ }
+ EXPORT_SYMBOL(bio_put);
+@@ -622,11 +760,50 @@ EXPORT_SYMBOL(__bio_clone_fast);
+  *
+  * 	Like __bio_clone_fast, only also allocates the returned bio
+  */
++
++#ifdef CONFIG_DEBUG_KMALLOC
++struct bio *bio_clone_fast_memhook(struct bio *bio, gfp_t gfp_mask, struct bio_set *bs, 
++	unsigned long caller_address, call_function_t cf_type)
++{
++	struct bio *b;
++
++	b = bio_alloc_bioset_memhook(gfp_mask, 0, bs, caller_address, cf_type);
++	if (!b)
++		return NULL;
++
++	__bio_clone_fast(b, bio);
++
++	if (bio_integrity(bio)) {
++		int ret;
++
++		ret = bio_integrity_clone(b, bio, gfp_mask);
++
++		if (ret < 0) {
++			bio_put(b);
++			return NULL;
++		}
++	}
++
++	return b;
++}
++EXPORT_SYMBOL(bio_clone_fast_memhook);
++
++struct bio *bio_clone_fast(struct bio *bio, gfp_t gfp_mask, struct bio_set *bs)
++{
++	unsigned long caller_address = _RET_IP_;
++	call_function_t cf_type = MEMPOOL_ALLOC;
++
++	return bio_clone_fast_memhook(bio, gfp_mask, bs, caller_address, cf_type);
++}
++EXPORT_SYMBOL(bio_clone_fast);
++#else
+ struct bio *bio_clone_fast(struct bio *bio, gfp_t gfp_mask, struct bio_set *bs)
+ {
+ 	struct bio *b;
++	unsigned long caller_address = _RET_IP_;
++	call_function_t cf_type = MEMPOOL_ALLOC;
+ 
+-	b = bio_alloc_bioset(gfp_mask, 0, bs);
++	b = bio_alloc_bioset_memhook(gfp_mask, 0, bs, caller_address, cf_type);
+ 	if (!b)
+ 		return NULL;
+ 
+@@ -646,6 +823,7 @@ struct bio *bio_clone_fast(struct bio *bio, gfp_t gfp_mask, struct bio_set *bs)
+ 	return b;
+ }
+ EXPORT_SYMBOL(bio_clone_fast);
++#endif
+ 
+ /**
+  *	bio_add_pc_page	-	attempt to add page to bio
+@@ -1045,6 +1223,24 @@ struct bio_map_data {
+ 	struct iovec iov[];
+ };
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++static struct bio_map_data *bio_alloc_map_data(struct iov_iter *data,
++					       gfp_t gfp_mask, unsigned long caller_address, call_function_t cf_type)
++{
++	struct bio_map_data *bmd;
++	if (data->nr_segs > UIO_MAXIOV)
++		return NULL;
++
++	bmd = kmalloc_memhook(sizeof(struct bio_map_data) +
++		       sizeof(struct iovec) * data->nr_segs, gfp_mask, caller_address, cf_type);
++	if (!bmd)
++		return NULL;
++	memcpy(bmd->iov, data->iov, sizeof(struct iovec) * data->nr_segs);
++	bmd->iter = *data;
++	bmd->iter.iov = bmd->iov;
++	return bmd;
++}
++#else
+ static struct bio_map_data *bio_alloc_map_data(struct iov_iter *data,
+ 					       gfp_t gfp_mask)
+ {
+@@ -1061,6 +1257,7 @@ static struct bio_map_data *bio_alloc_map_data(struct iov_iter *data,
+ 	bmd->iter.iov = bmd->iov;
+ 	return bmd;
+ }
++#endif
+ 
+ /**
+  * bio_copy_from_iter - copy all pages from iov_iter to bio
+@@ -1175,6 +1372,117 @@ int bio_uncopy_user(struct bio *bio)
+  *	to/from kernel pages as necessary. Must be paired with
+  *	call bio_uncopy_user() on io completion.
+  */
++#ifdef CONFIG_DEBUG_KMALLOC
++struct bio *bio_copy_user_iov(struct request_queue *q,
++			      struct rq_map_data *map_data,
++			      struct iov_iter *iter,
++			      gfp_t gfp_mask)
++{
++	struct bio_map_data *bmd;
++	struct page *page;
++	struct bio *bio;
++	int i = 0, ret;
++	int nr_pages;
++	unsigned int len = iter->count;
++	unsigned int offset = map_data ? offset_in_page(map_data->offset) : 0;
++	unsigned long caller_address = _RET_IP_;
++	call_function_t cf_type = MEMPOOL_ALLOC;
++
++	bmd = bio_alloc_map_data(iter, gfp_mask, caller_address, cf_type);
++	if (!bmd)
++		return ERR_PTR(-ENOMEM);
++
++	/*
++	 * We need to do a deep copy of the iov_iter including the iovecs.
++	 * The caller provided iov might point to an on-stack or otherwise
++	 * shortlived one.
++	 */
++	bmd->is_our_pages = map_data ? 0 : 1;
++
++	nr_pages = DIV_ROUND_UP(offset + len, PAGE_SIZE);
++	if (nr_pages > BIO_MAX_PAGES)
++		nr_pages = BIO_MAX_PAGES;
++
++	ret = -ENOMEM;
++	bio = bio_alloc_bioset_memhook(gfp_mask, nr_pages, NULL, caller_address, cf_type);
++	if (!bio)
++		goto out_bmd;
++
++	ret = 0;
++
++	if (map_data) {
++		nr_pages = 1 << map_data->page_order;
++		i = map_data->offset / PAGE_SIZE;
++	}
++	while (len) {
++		unsigned int bytes = PAGE_SIZE;
++
++		bytes -= offset;
++
++		if (bytes > len)
++			bytes = len;
++
++		if (map_data) {
++			if (i == map_data->nr_entries * nr_pages) {
++				ret = -ENOMEM;
++				break;
++			}
++
++			page = map_data->pages[i / nr_pages];
++			page += (i % nr_pages);
++
++			i++;
++		} else {
++			page = alloc_page(q->bounce_gfp | gfp_mask);
++			if (!page) {
++				ret = -ENOMEM;
++				break;
++			}
++		}
++
++		if (bio_add_pc_page(q, bio, page, bytes, offset) < bytes) {
++			if (!map_data)
++				__free_page(page);
++			break;
++		}
++
++		len -= bytes;
++		offset = 0;
++	}
++
++	if (ret)
++		goto cleanup;
++
++	if (map_data)
++		map_data->offset += bio->bi_iter.bi_size;
++
++	/*
++	 * success
++	 */
++	if (((iter->type & WRITE) && (!map_data || !map_data->null_mapped)) ||
++	    (map_data && map_data->from_user)) {
++		ret = bio_copy_from_iter(bio, iter);
++		if (ret)
++			goto cleanup;
++	} else {
++		if (bmd->is_our_pages)
++			zero_fill_bio(bio);
++		iov_iter_advance(iter, bio->bi_iter.bi_size);
++	}
++
++	bio->bi_private = bmd;
++	if (map_data && map_data->null_mapped)
++		bio_set_flag(bio, BIO_NULL_MAPPED);
++	return bio;
++cleanup:
++	if (!map_data)
++		bio_free_pages(bio);
++	bio_put(bio);
++out_bmd:
++	kfree(bmd);
++	return ERR_PTR(ret);
++}
++#else
+ struct bio *bio_copy_user_iov(struct request_queue *q,
+ 			      struct rq_map_data *map_data,
+ 			      struct iov_iter *iter,
+@@ -1282,6 +1590,7 @@ struct bio *bio_copy_user_iov(struct request_queue *q,
+ 	kfree(bmd);
+ 	return ERR_PTR(ret);
+ }
++#endif
+ 
+ /**
+  *	bio_map_user_iov - map user iovec into bio
+@@ -1292,6 +1601,97 @@ struct bio *bio_copy_user_iov(struct request_queue *q,
+  *	Map the user space address into a bio suitable for io to a block
+  *	device. Returns an error pointer in case of error.
+  */
++#ifdef CONFIG_DEBUG_KMALLOC
++struct bio *bio_map_user_iov(struct request_queue *q,
++			     struct iov_iter *iter,
++			     gfp_t gfp_mask)
++{
++	int j;
++	struct bio *bio;
++	int ret;
++	struct bio_vec *bvec;
++	unsigned long caller_address = _RET_IP_;
++	call_function_t cf_type = MEMPOOL_ALLOC;
++
++	if (!iov_iter_count(iter))
++		return ERR_PTR(-EINVAL);
++
++	bio = bio_alloc_bioset_memhook(gfp_mask, iov_iter_npages(iter, BIO_MAX_PAGES), NULL, caller_address, cf_type);
++	if (!bio)
++		return ERR_PTR(-ENOMEM);
++
++	while (iov_iter_count(iter)) {
++		struct page **pages;
++		ssize_t bytes;
++		size_t offs, added = 0;
++		int npages;
++
++		bytes = iov_iter_get_pages_alloc(iter, &pages, LONG_MAX, &offs);
++		if (unlikely(bytes <= 0)) {
++			ret = bytes ? bytes : -EFAULT;
++			goto out_unmap;
++		}
++
++		npages = DIV_ROUND_UP(offs + bytes, PAGE_SIZE);
++
++		if (unlikely(offs & queue_dma_alignment(q))) {
++			ret = -EINVAL;
++			j = 0;
++		} else {
++			for (j = 0; j < npages; j++) {
++				struct page *page = pages[j];
++				unsigned int n = PAGE_SIZE - offs;
++				unsigned short prev_bi_vcnt = bio->bi_vcnt;
++
++				if (n > bytes)
++					n = bytes;
++
++				if (!bio_add_pc_page(q, bio, page, n, offs))
++					break;
++
++				/*
++				 * check if vector was merged with previous
++				 * drop page reference if needed
++				 */
++				if (bio->bi_vcnt == prev_bi_vcnt)
++					put_page(page);
++
++				added += n;
++				bytes -= n;
++				offs = 0;
++			}
++			iov_iter_advance(iter, added);
++		}
++		/*
++		 * release the pages we didn't map into the bio, if any
++		 */
++		while (j < npages)
++			put_page(pages[j++]);
++		kvfree(pages);
++		/* couldn't stuff something into bio? */
++		if (bytes)
++			break;
++	}
++
++	bio_set_flag(bio, BIO_USER_MAPPED);
++
++	/*
++	 * subtle -- if bio_map_user_iov() ended up bouncing a bio,
++	 * it would normally disappear when its bi_end_io is run.
++	 * however, we need it for the unmap, so grab an extra
++	 * reference to it
++	 */
++	bio_get(bio);
++	return bio;
++
++ out_unmap:
++	bio_for_each_segment_all(bvec, bio, j) {
++		put_page(bvec->bv_page);
++	}
++	bio_put(bio);
++	return ERR_PTR(ret);
++}
++#else
+ struct bio *bio_map_user_iov(struct request_queue *q,
+ 			     struct iov_iter *iter,
+ 			     gfp_t gfp_mask)
+@@ -1379,6 +1779,7 @@ struct bio *bio_map_user_iov(struct request_queue *q,
+ 	bio_put(bio);
+ 	return ERR_PTR(ret);
+ }
++#endif
+ 
+ static void __bio_unmap_user(struct bio *bio)
+ {
+@@ -1428,6 +1829,50 @@ static void bio_map_kern_endio(struct bio *bio)
+  *	Map the kernel address into a bio suitable for io to a block
+  *	device. Returns an error pointer in case of error.
+  */
++#ifdef CONFIG_DEBUG_KMALLOC
++struct bio *bio_map_kern(struct request_queue *q, void *data, unsigned int len,
++			 gfp_t gfp_mask)
++{
++	unsigned long kaddr = (unsigned long)data;
++	unsigned long end = (kaddr + len + PAGE_SIZE - 1) >> PAGE_SHIFT;
++	unsigned long start = kaddr >> PAGE_SHIFT;
++	const int nr_pages = end - start;
++	int offset, i;
++	struct bio *bio;
++	unsigned long caller_address = _RET_IP_;
++	call_function_t cf_type = MEMPOOL_ALLOC;
++
++	bio = bio_alloc_bioset_memhook(gfp_mask, nr_pages, NULL, caller_address, cf_type);
++	if (!bio)
++		return ERR_PTR(-ENOMEM);
++
++	offset = offset_in_page(kaddr);
++	for (i = 0; i < nr_pages; i++) {
++		unsigned int bytes = PAGE_SIZE - offset;
++
++		if (len <= 0)
++			break;
++
++		if (bytes > len)
++			bytes = len;
++
++		if (bio_add_pc_page(q, bio, virt_to_page(data), bytes,
++				    offset) < bytes) {
++			/* we don't support partial mappings */
++			bio_put(bio);
++			return ERR_PTR(-EINVAL);
++		}
++
++		data += bytes;
++		len -= bytes;
++		offset = 0;
++	}
++
++	bio->bi_end_io = bio_map_kern_endio;
++	return bio;
++}
++EXPORT_SYMBOL(bio_map_kern);
++#else
+ struct bio *bio_map_kern(struct request_queue *q, void *data, unsigned int len,
+ 			 gfp_t gfp_mask)
+ {
+@@ -1468,6 +1913,7 @@ struct bio *bio_map_kern(struct request_queue *q, void *data, unsigned int len,
+ 	return bio;
+ }
+ EXPORT_SYMBOL(bio_map_kern);
++#endif
+ 
+ static void bio_copy_kern_endio(struct bio *bio)
+ {
+@@ -1500,6 +1946,66 @@ static void bio_copy_kern_endio_read(struct bio *bio)
+  *	copy the kernel address into a bio suitable for io to a block
+  *	device. Returns an error pointer in case of error.
+  */
++#ifdef CONFIG_DEBUG_KMALLOC
++struct bio *bio_copy_kern(struct request_queue *q, void *data, unsigned int len,
++			  gfp_t gfp_mask, int reading)
++{
++	unsigned long kaddr = (unsigned long)data;
++	unsigned long end = (kaddr + len + PAGE_SIZE - 1) >> PAGE_SHIFT;
++	unsigned long start = kaddr >> PAGE_SHIFT;
++	struct bio *bio;
++	void *p = data;
++	int nr_pages = 0;
++	unsigned long caller_address = _RET_IP_;
++	call_function_t cf_type = MEMPOOL_ALLOC;
++
++	/*
++	 * Overflow, abort
++	 */
++	if (end < start)
++		return ERR_PTR(-EINVAL);
++
++	nr_pages = end - start;
++	bio = bio_alloc_bioset_memhook(gfp_mask, nr_pages, NULL, caller_address, cf_type);
++	if (!bio)
++		return ERR_PTR(-ENOMEM);
++
++	while (len) {
++		struct page *page;
++		unsigned int bytes = PAGE_SIZE;
++
++		if (bytes > len)
++			bytes = len;
++
++		page = alloc_page(q->bounce_gfp | gfp_mask);
++		if (!page)
++			goto cleanup;
++
++		if (!reading)
++			memcpy(page_address(page), p, bytes);
++
++		if (bio_add_pc_page(q, bio, page, bytes, 0) < bytes)
++			break;
++
++		len -= bytes;
++		p += bytes;
++	}
++
++	if (reading) {
++		bio->bi_end_io = bio_copy_kern_endio_read;
++		bio->bi_private = data;
++	} else {
++		bio->bi_end_io = bio_copy_kern_endio;
++	}
++
++	return bio;
++
++cleanup:
++	bio_free_pages(bio);
++	bio_put(bio);
++	return ERR_PTR(-ENOMEM);
++}
++#else
+ struct bio *bio_copy_kern(struct request_queue *q, void *data, unsigned int len,
+ 			  gfp_t gfp_mask, int reading)
+ {
+@@ -1556,6 +2062,7 @@ struct bio *bio_copy_kern(struct request_queue *q, void *data, unsigned int len,
+ 	bio_put(bio);
+ 	return ERR_PTR(-ENOMEM);
+ }
++#endif
+ 
+ /*
+  * bio_set_pages_dirty() and bio_check_pages_dirty() are support functions
+@@ -1812,6 +2319,44 @@ EXPORT_SYMBOL(bio_endio);
+  * to @bio's bi_io_vec; it is the caller's responsibility to ensure that
+  * @bio is not freed before the split.
+  */
++#ifdef CONFIG_DEBUG_KMALLOC
++struct bio *bio_split_memhook(struct bio *bio, int sectors,
++		      gfp_t gfp, struct bio_set *bs, unsigned long caller_address, call_function_t cf_type)
++{
++	struct bio *split;
++
++	BUG_ON(sectors <= 0);
++	BUG_ON(sectors >= bio_sectors(bio));
++
++	split = bio_clone_fast_memhook(bio, gfp, bs, caller_address, cf_type);
++	if (!split)
++		return NULL;
++
++	split->bi_iter.bi_size = sectors << 9;
++
++	if (bio_integrity(split))
++		bio_integrity_trim(split);
++
++	bio_advance(bio, split->bi_iter.bi_size);
++	bio->bi_iter.bi_done = 0;
++
++	if (bio_flagged(bio, BIO_TRACE_COMPLETION))
++		bio_set_flag(split, BIO_TRACE_COMPLETION);
++
++	return split;
++}
++EXPORT_SYMBOL(bio_split_memhook);
++
++struct bio *bio_split(struct bio *bio, int sectors,
++		      gfp_t gfp, struct bio_set *bs)
++{
++	unsigned long caller_address = _RET_IP_;
++	call_function_t cf_type = MEMPOOL_ALLOC;
++
++	return bio_split_memhook(bio, sectors, gfp, bs, caller_address, cf_type);
++}
++EXPORT_SYMBOL(bio_split);
++#else
+ struct bio *bio_split(struct bio *bio, int sectors,
+ 		      gfp_t gfp, struct bio_set *bs)
+ {
+@@ -1838,6 +2383,7 @@ struct bio *bio_split(struct bio *bio, int sectors,
+ 	return split;
+ }
+ EXPORT_SYMBOL(bio_split);
++#endif
+ 
+ /**
+  * bio_trim - trim a bio
+diff --git a/drivers/md/dm-bufio.c b/drivers/md/dm-bufio.c
+index b3b799f84dcc..ec8d829a974d 100644
+--- a/drivers/md/dm-bufio.c
++++ b/drivers/md/dm-bufio.c
+@@ -398,6 +398,7 @@ static void free_buffer_data(struct dm_bufio_client *c,
+ {
+ 	switch (data_mode) {
+ 	case DATA_MODE_SLAB:
++		printk(KERN_DEBUG "dm_mod_free_b_data:%lx\n", (unsigned long)data);
+ 		kmem_cache_free(c->slab_cache, data);
+ 		break;
+ 
+@@ -431,6 +432,7 @@ static struct dm_buffer *alloc_buffer(struct dm_bufio_client *c, gfp_t gfp_mask)
+ 
+ 	b->data = alloc_buffer_data(c, gfp_mask, &b->data_mode);
+ 	if (!b->data) {
++		printk(KERN_DEBUG "dm_mod_alloc_b:%lx\n", (unsigned long)b);
+ 		kmem_cache_free(c->slab_buffer, b);
+ 		return NULL;
+ 	}
+@@ -453,6 +455,7 @@ static void free_buffer(struct dm_buffer *b)
+ 	adjust_total_allocated(b->data_mode, -(long)c->block_size);
+ 
+ 	free_buffer_data(c, b->data, b->data_mode);
++	printk(KERN_DEBUG "dm_mod_free_b:%lx\n", (unsigned long)b);
+ 	kmem_cache_free(c->slab_buffer, b);
+ }
+ 
+diff --git a/drivers/md/dm-snap.c b/drivers/md/dm-snap.c
+index 52101e5c7258..ec9651b0c4b7 100644
+--- a/drivers/md/dm-snap.c
++++ b/drivers/md/dm-snap.c
+@@ -650,8 +650,10 @@ static void dm_exception_table_exit(struct dm_exception_table *et,
+ 	for (i = 0; i < size; i++) {
+ 		slot = et->table + i;
+ 
+-		list_for_each_entry_safe (ex, next, slot, hash_list)
++		list_for_each_entry_safe (ex, next, slot, hash_list){
++			printk(KERN_DEBUG "dm_mod_dm_exception_table_exit:%lx\n",(unsigned long)ex);
+ 			kmem_cache_free(mem, ex);
++		}
+ 	}
+ 
+ 	vfree(et->table);
+@@ -699,6 +701,7 @@ static struct dm_exception *alloc_completed_exception(gfp_t gfp)
+ 
+ static void free_completed_exception(struct dm_exception *e)
+ {
++	printk(KERN_DEBUG "dm_mod_free_completed_exception:%lx\n",(unsigned long)e);
+ 	kmem_cache_free(exception_cache, e);
+ }
+ 
+diff --git a/drivers/md/dm-uevent.c b/drivers/md/dm-uevent.c
+index 8efe033bab55..f5e5a29816ee 100644
+--- a/drivers/md/dm-uevent.c
++++ b/drivers/md/dm-uevent.c
+@@ -51,6 +51,7 @@ struct dm_uevent {
+ 
+ static void dm_uevent_free(struct dm_uevent *event)
+ {
++	printk(KERN_DEBUG "dm_mod_uevent_free: %lx\n", (unsigned long)event);
+ 	kmem_cache_free(_dm_event_cache, event);
+ }
+ 
+diff --git a/drivers/md/raid5-ppl.c b/drivers/md/raid5-ppl.c
+index 3a7c36326589..e7b14d228bd4 100644
+--- a/drivers/md/raid5-ppl.c
++++ b/drivers/md/raid5-ppl.c
+@@ -220,6 +220,7 @@ static void *ppl_io_pool_alloc(gfp_t gfp_mask, void *pool_data)
+ 
+ 	io->header_page = alloc_page(gfp_mask);
+ 	if (!io->header_page) {
++		printk(KERN_DEBUG "dm_mod_ppl_io_pool_alloc:%lx\n",(unsigned long)io);
+ 		kmem_cache_free(kc, io);
+ 		return NULL;
+ 	}
+@@ -233,6 +234,7 @@ static void ppl_io_pool_free(void *element, void *pool_data)
+ 	struct ppl_io_unit *io = element;
+ 
+ 	__free_page(io->header_page);
++	printk(KERN_DEBUG "dm_mod_ppl_io_pool_free:%lx\n",(unsigned long)io);
+ 	kmem_cache_free(kc, io);
+ }
+ 
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 2d63668cfadd..02247fab7a93 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -2136,6 +2136,7 @@ static void free_stripe(struct kmem_cache *sc, struct stripe_head *sh)
+ {
+ 	if (sh->ppl_page)
+ 		__free_page(sh->ppl_page);
++	printk(KERN_DEBUG "dm_mod_free_stripe:%lx\n",(unsigned long)sh);
+ 	kmem_cache_free(sc, sh);
+ }
+ 
+diff --git a/include/asm-generic/sections.h b/include/asm-generic/sections.h
+index ea5987bb0b84..65086f94408e 100644
+--- a/include/asm-generic/sections.h
++++ b/include/asm-generic/sections.h
+@@ -32,6 +32,9 @@
+  *	__softirqentry_text_start, __softirqentry_text_end
+  *	__start_opd, __end_opd
+  */
++
++// extern char __test_module_start[], __test_module_end[];
++
+ extern char _text[], _stext[], _etext[];
+ extern char _data[], _sdata[], _edata[];
+ extern char __bss_start[], __bss_stop[];
+diff --git a/include/linux/mempool.h b/include/linux/mempool.h
+index 0c964ac107c2..be9a2ee292d3 100644
+--- a/include/linux/mempool.h
++++ b/include/linux/mempool.h
+@@ -8,6 +8,10 @@
+ #include <linux/wait.h>
+ #include <linux/compiler.h>
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++#include <linux/statis_memory.h>
++#endif
++
+ struct kmem_cache;
+ 
+ typedef void * (mempool_alloc_t)(gfp_t gfp_mask, void *pool_data);
+@@ -108,4 +112,9 @@ static inline mempool_t *mempool_create_page_pool(int min_nr, int order)
+ 			      (void *)(long)order);
+ }
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++void *mempool_alloc_memhook(mempool_t *pool, gfp_t gfp_mask, unsigned long caller_address, call_function_t cf_type);
++
++#endif
++
+ #endif /* _LINUX_MEMPOOL_H */
+diff --git a/include/linux/module.h b/include/linux/module.h
+index e49023514820..d12b75b0b880 100644
+--- a/include/linux/module.h
++++ b/include/linux/module.h
+@@ -42,13 +42,25 @@ struct modversion_info {
+ struct module;
+ struct exception_table_entry;
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
+ struct module_kobject {
+ 	struct kobject kobj;
++	int used_memory;
++	unsigned int used_pages;
+ 	struct module *mod;
+ 	struct kobject *drivers_dir;
+ 	struct module_param_attrs *mp;
+ 	struct completion *kobj_completion;
+ } __randomize_layout;
++#else
++struct module_kobject {
++	struct kobject kobj;
++	struct module *mod;
++	struct kobject *drivers_dir;
++	struct module_param_attrs *mp;
++	struct completion *kobj_completion;
++} __randomize_layout;
++#endif/*CONFIG_DEBUG_KMALLOC*/
+ 
+ struct module_attribute {
+ 	struct attribute attr;
+@@ -72,6 +84,18 @@ extern ssize_t __modver_version_show(struct module_attribute *,
+ 
+ extern struct module_attribute module_uevent;
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++
++struct module_usedmemory_attribute {
++	struct module_attribute mattr;
++	struct module* mod;
++	const char *used;
++} __attribute__ ((__aligned__(sizeof(void *))));
++
++extern ssize_t __module_usedmemory_show(struct module_attribute *,
++				     struct module_kobject *, char *);
++#endif
++
+ /* These are either module local, or the kernel's dummy ones. */
+ extern int init_module(void);
+ extern void cleanup_module(void);
+@@ -642,6 +666,11 @@ int unregister_module_notifier(struct notifier_block *nb);
+ 
+ extern void print_modules(void);
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++extern void print_modules_debug(void);
++struct list_head *get_module_list(void);
++#endif
++
+ static inline bool module_requested_async_probing(struct module *module)
+ {
+ 	return module && module->async_probe_requested;
+diff --git a/include/linux/slab.h b/include/linux/slab.h
+index 788f04a7ca76..19607aaa62b0 100644
+--- a/include/linux/slab.h
++++ b/include/linux/slab.h
+@@ -18,6 +18,11 @@
+ #include <linux/workqueue.h>
+ #include <linux/percpu-refcount.h>
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++#include <linux/module.h>
++#include <linux/statis_memory.h>
++#endif
++
+ 
+ /*
+  * Flags to pass to kmem_cache_create().
+@@ -189,6 +194,9 @@ void * __must_check krealloc(const void *, size_t, gfp_t);
+ void kfree(const void *);
+ void kzfree(const void *);
+ size_t ksize(const void *);
++#ifdef CONFIG_DEBUG_KMALLOC
++void kfree_memhook(const void *x, unsigned long caller_address);
++#endif
+ 
+ #ifdef CONFIG_HAVE_HARDENED_USERCOPY_ALLOCATOR
+ void __check_heap_object(const void *ptr, unsigned long n, struct page *page,
+@@ -393,6 +401,12 @@ void *__kmalloc(size_t size, gfp_t flags) __assume_kmalloc_alignment __malloc;
+ void *kmem_cache_alloc(struct kmem_cache *, gfp_t flags) __assume_slab_alignment __malloc;
+ void kmem_cache_free(struct kmem_cache *, void *);
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++void* __kmalloc_memhook(size_t size, gfp_t flags, unsigned long caller_address, call_function_t cf_type);
++void *kmem_cache_alloc_memhook(struct kmem_cache *s, gfp_t gfpflags, unsigned long caller_address, call_function_t cf_type);
++void kmem_cache_free_memhook(struct kmem_cache *s, void *x, unsigned long caller_address);
++#endif
++
+ /*
+  * Bulk allocation and freeing operations. These are accelerated in an
+  * allocator specific way to avoid taking locks repeatedly or building
+@@ -415,6 +429,45 @@ static __always_inline void kfree_bulk(size_t size, void **p)
+ #ifdef CONFIG_NUMA
+ void *__kmalloc_node(size_t size, gfp_t flags, int node) __assume_kmalloc_alignment __malloc;
+ void *kmem_cache_alloc_node(struct kmem_cache *, gfp_t flags, int node) __assume_slab_alignment __malloc;
++#ifdef CONFIG_DEBUG_KMALLOC
++void *__kmalloc_node_memhook(size_t size, gfp_t flags, int node, 
++	unsigned long caller_address, call_function_t cf_type) __assume_kmalloc_alignment __malloc;
++void *kmem_cache_alloc_node_memhook(struct kmem_cache *, gfp_t flags, int node, unsigned long caller_address, \
++	call_function_t cf_type) __assume_slab_alignment __malloc;
++#endif
++#else
++#ifdef CONFIG_DEBUG_KMALLOC
++static __always_inline void *__kmalloc_node_memhook(size_t size, gfp_t flags, int node, unsigned long caller_address)
++{
++	return __kmalloc_memhook(size, flags, caller_address, cf_type);
++}
++
++static __always_inline void *__kmalloc_node(size_t size, gfp_t flags, int node)
++{
++	unsigned long caller_address;
++	call_function_t cf_type = __KMALLOC_NODE;
++
++	caller_address = (unsigned long)get_pc();
++
++	return __kmalloc_node_memhook(size, flags, node, caller_address, cf_type);
++
++}
++
++static __always_inline void *kmem_cache_alloc_node_memhook(struct kmem_cache *s, gfp_t flags, int node, \
++	unsigned long caller_address, call_function_t cf_type)
++{
++	return kmem_cache_alloc_memhook(s, flags, caller_address, cf_type);
++}
++
++static __always_inline void *kmem_cache_alloc_node(struct kmem_cache *s, gfp_t flags, int node)
++{
++	unsigned long caller_address;
++	call_function_t cf_type = KMEM_CACHE_ALLOC_NODE;
++
++	caller_address = (unsigned long)get_pc();
++
++	return kmem_cache_alloc_node_memhook(s, flags, node, caller_address, cf_type);
++}
+ #else
+ static __always_inline void *__kmalloc_node(size_t size, gfp_t flags, int node)
+ {
+@@ -425,16 +478,47 @@ static __always_inline void *kmem_cache_alloc_node(struct kmem_cache *s, gfp_t f
+ {
+ 	return kmem_cache_alloc(s, flags);
+ }
++#endif /*CONFIG_DEBUG_KMALLOC*/
+ #endif
+ 
+ #ifdef CONFIG_TRACING
+ extern void *kmem_cache_alloc_trace(struct kmem_cache *, gfp_t, size_t) __assume_slab_alignment __malloc;
+-
++#ifdef CONFIG_DEBUG_KMALLOC
++extern void *kmem_cache_alloc_trace_memhook(struct kmem_cache *, gfp_t, 
++	size_t, unsigned long, call_function_t cf_type) __assume_slab_alignment __malloc;
++#endif /*CONFIG_DEBUG_KMALLOC*/
+ #ifdef CONFIG_NUMA
+ extern void *kmem_cache_alloc_node_trace(struct kmem_cache *s,
+ 					   gfp_t gfpflags,
+ 					   int node, size_t size) __assume_slab_alignment __malloc;
++#ifdef CONFIG_DEBUG_KMALLOC
++extern void *kmem_cache_alloc_node_trace_memhook(struct kmem_cache *s,
++					   gfp_t gfpflags, int node, size_t size, 
++					   unsigned long caller_address, call_function_t cf_type) __assume_slab_alignment __malloc;
++#endif /*CONFIG_DEBUG_KMALLOC*/				
+ #else
++#ifdef CONFIG_DEBUG_KMALLOC
++static __always_inline void *
++kmem_cache_alloc_node_trace_memhook(struct kmem_cache *s,
++			      gfp_t gfpflags, int node, size_t size, 
++				  unsigned long caller_address, call_function_t cf_type)
++{
++	return kmem_cache_alloc_trace_memhook(s, gfpflags, size, caller_address, cf_type);
++}
++
++static __always_inline void *
++kmem_cache_alloc_node_trace(struct kmem_cache *s,
++			      gfp_t gfpflags,
++			      int node, size_t size)
++{
++	unsigned long caller_address;
++	call_function_t cf_type = KMEM_CACHE_ALLOC_NODE_TRACE;
++
++	caller_address = (unsigned long)get_pc();
++
++	return kmem_cache_alloc_node_trace_memhook(s, gfpflags, node, size, caller_address, cf_type);
++}
++#else /*CONFIG_DEBUG_KMALLOC*/
+ static __always_inline void *
+ kmem_cache_alloc_node_trace(struct kmem_cache *s,
+ 			      gfp_t gfpflags,
+@@ -442,9 +526,57 @@ kmem_cache_alloc_node_trace(struct kmem_cache *s,
+ {
+ 	return kmem_cache_alloc_trace(s, gfpflags, size);
+ }
++#endif
+ #endif /* CONFIG_NUMA */
+ 
+ #else /* CONFIG_TRACING */
++#ifdef CONFIG_DEBUG_KMALLOC
++
++static __always_inline void *kmem_cache_alloc_trace_memhook(struct kmem_cache *s,
++		gfp_t flags, size_t size, unsigned long caller_address, call_function_t cf_type)
++{
++	void *ret = kmem_cache_alloc_memhook(s, flags, caller_address, cf_type);
++
++	kasan_kmalloc(s, ret, size, flags);
++	return ret;
++}
++
++static __always_inline void *kmem_cache_alloc_trace(struct kmem_cache *s,
++		gfp_t flags, size_t size)
++{
++	unsigned long caller_address;
++	call_function_t cf_type = KMEM_CACHE_ALLOC_TRACE;
++
++	caller_address = (unsigned long)get_pc();
++
++	return kmem_cache_alloc_trace_memhook(s, flags, size, caller_address, cf_type);
++}
++
++static __always_inline void *
++kmem_cache_alloc_node_trace_memhook(struct kmem_cache *s,
++			      gfp_t gfpflags, int node, size_t size, 
++				  unsigned long caller_address, call_function_t cf_type)
++{
++	void *ret = kmem_cache_alloc_node_memhook(s, gfpflags, node, caller_address, cf_type);
++
++	kasan_kmalloc(s, ret, size, gfpflags);
++	return ret;
++}
++
++static __always_inline void *
++kmem_cache_alloc_node_trace(struct kmem_cache *s,
++			      gfp_t gfpflags,
++			      int node, size_t size)
++{
++	unsigned long caller_address;
++	call_function_t cf_type = KMEM_CACHE_ALLOC_NODE_TRACE;
++
++	caller_address = (unsigned long)get_pc();
++
++	return kmem_cache_alloc_node_trace_memhook(s, gfpflags, node, size, caller_address, cf_type);
++}
++
++#else
+ static __always_inline void *kmem_cache_alloc_trace(struct kmem_cache *s,
+ 		gfp_t flags, size_t size)
+ {
+@@ -464,6 +596,7 @@ kmem_cache_alloc_node_trace(struct kmem_cache *s,
+ 	kasan_kmalloc(s, ret, size, gfpflags);
+ 	return ret;
+ }
++#endif
+ #endif /* CONFIG_TRACING */
+ 
+ extern void *kmalloc_order(size_t size, gfp_t flags, unsigned int order) __assume_page_alignment __malloc;
+@@ -478,11 +611,34 @@ kmalloc_order_trace(size_t size, gfp_t flags, unsigned int order)
+ }
+ #endif
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++static __always_inline void *kmalloc_large_memhook(size_t size, gfp_t flags, unsigned long caller_address, call_function_t cf_type)
++{
++	void *ret;
++	unsigned int order = get_order(size);
++
++	ret = kmalloc_order_trace(size, flags, order);
++
++	record_page_to_sysfs(order, ret, caller_address, cf_type);
++
++	return ret;
++}
++
++static __always_inline void *kmalloc_large(size_t size, gfp_t flags)
++{
++	unsigned long caller_address = (unsigned long)get_pc();
++	call_function_t cf_type = KMALLOC_LARGE;
++
++	return kmalloc_large_memhook(size, flags, caller_address, cf_type);
++}
++
++#else
+ static __always_inline void *kmalloc_large(size_t size, gfp_t flags)
+ {
+ 	unsigned int order = get_order(size);
+ 	return kmalloc_order_trace(size, flags, order);
+ }
++#endif
+ 
+ /**
+  * kmalloc - allocate memory
+@@ -535,6 +691,49 @@ static __always_inline void *kmalloc_large(size_t size, gfp_t flags)
+  * for general use, and so are not documented here. For a full list of
+  * potential flags, always refer to linux/gfp.h.
+  */
++#ifdef CONFIG_DEBUG_KMALLOC
++
++//extern char _stext[], _etext[];
++//extern char __inittext_begin[], __inittext_end[];
++static __always_inline void *kmalloc_memhook(size_t size, gfp_t flags, unsigned long caller_address, call_function_t cf_type)
++{
++
++	void *ret;
++	
++	if (__builtin_constant_p(size)) {
++#ifndef CONFIG_SLOB
++		unsigned int index;
++#endif
++		if (size > KMALLOC_MAX_CACHE_SIZE){
++			ret = kmalloc_large_memhook(size, flags, caller_address, cf_type);
++			return ret;
++		}
++#ifndef CONFIG_SLOB
++		index = kmalloc_index(size);
++		if (!index)
++			return ZERO_SIZE_PTR;
++
++		return kmem_cache_alloc_trace_memhook(
++				kmalloc_caches[kmalloc_type(flags)][index],
++				flags, size, caller_address, cf_type);
++#endif
++	}
++	return __kmalloc_memhook(size, flags, caller_address, cf_type);
++}
++static __always_inline void *kmalloc(size_t size, gfp_t flags)
++{
++	void* ret;
++	unsigned long caller_address;
++	call_function_t cf_type = KMALLOC;
++
++	caller_address = (unsigned long)get_pc();
++
++	ret = kmalloc_memhook(size, flags, caller_address, cf_type);
++
++	return ret;
++}
++
++#else
+ static __always_inline void *kmalloc(size_t size, gfp_t flags)
+ {
+ 	if (__builtin_constant_p(size)) {
+@@ -557,6 +756,8 @@ static __always_inline void *kmalloc(size_t size, gfp_t flags)
+ 	return __kmalloc(size, flags);
+ }
+ 
++#endif /*CONFIG_KMALLOC_DEBUG*/
++
+ /*
+  * Determine size used for the nth kmalloc cache.
+  * return size or 0 if a kmalloc cache for that
+@@ -577,6 +778,36 @@ static __always_inline unsigned int kmalloc_size(unsigned int n)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++static __always_inline void *kmalloc_node_memhook(size_t size, gfp_t flags, int node, 
++	unsigned long caller_address, call_function_t cf_type)
++{
++#ifndef CONFIG_SLOB
++	if (__builtin_constant_p(size) &&
++		size <= KMALLOC_MAX_CACHE_SIZE) {
++		unsigned int i = kmalloc_index(size);
++
++		if (!i)
++			return ZERO_SIZE_PTR;
++
++		return kmem_cache_alloc_node_trace_memhook(
++				kmalloc_caches[kmalloc_type(flags)][i],
++						flags, node, size, caller_address, cf_type);
++	}
++#endif
++	return __kmalloc_node_memhook(size, flags, node, caller_address, cf_type);
++}
++
++static __always_inline void *kmalloc_node(size_t size, gfp_t flags, int node)
++{
++	unsigned long caller_address;
++	call_function_t cf_type = KMALLOC_NODE;
++
++	caller_address = (unsigned long)get_pc();
++
++	return kmalloc_node_memhook(size, flags, node, caller_address, cf_type);
++}
++#else
+ static __always_inline void *kmalloc_node(size_t size, gfp_t flags, int node)
+ {
+ #ifndef CONFIG_SLOB
+@@ -594,6 +825,7 @@ static __always_inline void *kmalloc_node(size_t size, gfp_t flags, int node)
+ #endif
+ 	return __kmalloc_node(size, flags, node);
+ }
++#endif/*CONFIG_DEBUG_KMALLOC*/
+ 
+ struct memcg_cache_array {
+ 	struct rcu_head rcu;
+@@ -665,6 +897,29 @@ int memcg_update_all_caches(int num_memcgs);
+  * @size: element size.
+  * @flags: the type of memory to allocate (see kmalloc).
+  */
++#ifdef CONFIG_DEBUG_KMALLOC
++static inline void *kmalloc_array_memhook(size_t n, size_t size, gfp_t flags,
++	unsigned long caller_address, call_function_t cf_type)
++{
++	size_t bytes;
++
++	if (unlikely(check_mul_overflow(n, size, &bytes)))
++		return NULL;
++	if (__builtin_constant_p(n) && __builtin_constant_p(size))
++		return kmalloc_memhook(bytes, flags, caller_address, cf_type);
++	return __kmalloc_memhook(bytes, flags, caller_address, cf_type);
++}
++
++static inline void *kmalloc_array(size_t n, size_t size, gfp_t flags)
++{
++	unsigned long caller_address;
++	call_function_t cf_type = KMALLOC_ARRAY;
++
++	caller_address = (unsigned long)get_pc();
++
++	return kmalloc_array_memhook(n, size, flags, caller_address, cf_type);
++}
++#else
+ static inline void *kmalloc_array(size_t n, size_t size, gfp_t flags)
+ {
+ 	size_t bytes;
+@@ -675,6 +930,7 @@ static inline void *kmalloc_array(size_t n, size_t size, gfp_t flags)
+ 		return kmalloc(bytes, flags);
+ 	return __kmalloc(bytes, flags);
+ }
++#endif /*CONFIG_DEBUG_KMALLOC*/
+ 
+ /**
+  * kcalloc - allocate memory for an array. The memory is set to zero.
+@@ -682,11 +938,28 @@ static inline void *kmalloc_array(size_t n, size_t size, gfp_t flags)
+  * @size: element size.
+  * @flags: the type of memory to allocate (see kmalloc).
+  */
++#ifdef CONFIG_DEBUG_KMALLOC
++static inline void *kcalloc_memhook(size_t n, size_t size, gfp_t flags,
++	unsigned long caller_address, call_function_t cf_type)
++{
++	return kmalloc_array_memhook(n, size, flags | __GFP_ZERO, caller_address, cf_type);
++}
++
++static inline void *kcalloc(size_t n, size_t size, gfp_t flags)
++{
++	unsigned long caller_address;
++	call_function_t cf_type = KCALLOC;
++
++	caller_address = (unsigned long)get_pc();
++
++	return kcalloc_memhook(n, size, flags, caller_address, cf_type);
++}
++#else
+ static inline void *kcalloc(size_t n, size_t size, gfp_t flags)
+ {
+ 	return kmalloc_array(n, size, flags | __GFP_ZERO);
+ }
+-
++#endif /*CONFIG_DEBUG_KMALLOC*/
+ /*
+  * kmalloc_track_caller is a special version of kmalloc that records the
+  * calling function of the routine calling it for slab leak tracking instead
+@@ -699,6 +972,36 @@ extern void *__kmalloc_track_caller(size_t, gfp_t, unsigned long);
+ #define kmalloc_track_caller(size, flags) \
+ 	__kmalloc_track_caller(size, flags, _RET_IP_)
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++extern void *__kmalloc_track_caller_memhook(size_t, gfp_t, unsigned long, unsigned long, call_function_t);
++#define kmalloc_track_caller_memhook(size, flags, caller_address, cf_type) \
++	__kmalloc_track_caller_memhook(size, flags, _RET_IP_, caller_address, cf_type)
++#endif
++
++#ifdef CONFIG_DEBUG_KMALLOC
++static inline void *kmalloc_array_node_memhook(size_t n, size_t size, gfp_t flags,
++				       int node, unsigned long caller_address, call_function_t cf_type)
++{
++	size_t bytes;
++
++	if (unlikely(check_mul_overflow(n, size, &bytes)))
++		return NULL;
++	if (__builtin_constant_p(n) && __builtin_constant_p(size))
++		return kmalloc_node_memhook(bytes, flags, node, caller_address, cf_type);
++	return __kmalloc_node_memhook(bytes, flags, node, caller_address, cf_type);
++}
++
++static inline void *kmalloc_array_node(size_t n, size_t size, gfp_t flags,
++				       int node)
++{
++	unsigned long caller_address;
++	call_function_t cf_type = KMALLOC_ARRAY_NODE;
++
++	caller_address = (unsigned long)get_pc();
++
++	return kmalloc_array_node_memhook(n, size, flags, node, caller_address, cf_type);
++}
++#else
+ static inline void *kmalloc_array_node(size_t n, size_t size, gfp_t flags,
+ 				       int node)
+ {
+@@ -710,12 +1013,30 @@ static inline void *kmalloc_array_node(size_t n, size_t size, gfp_t flags,
+ 		return kmalloc_node(bytes, flags, node);
+ 	return __kmalloc_node(bytes, flags, node);
+ }
++#endif /*CONFIG_DEBUG_KMALLOC*/
++
++#ifdef CONFIG_DEBUG_KMALLOC
++static inline void *kcalloc_node_memhook(size_t n, size_t size, gfp_t flags, int node,
++	unsigned long caller_address, call_function_t cf_type)
++{
++	return kmalloc_array_node_memhook(n, size, flags | __GFP_ZERO, node, caller_address, cf_type);
++}
+ 
++static inline void *kcalloc_node(size_t n, size_t size, gfp_t flags, int node)
++{
++	unsigned long caller_address;
++	call_function_t cf_type = KCALLOC_NODE;
++
++	caller_address = (unsigned long)get_pc();
++
++	return kcalloc_node_memhook(n, size, flags, node, caller_address, cf_type);
++}
++#else
+ static inline void *kcalloc_node(size_t n, size_t size, gfp_t flags, int node)
+ {
+ 	return kmalloc_array_node(n, size, flags | __GFP_ZERO, node);
+ }
+-
++#endif /*CONFIG_DEBUG_KMALLOC*/
+ 
+ #ifdef CONFIG_NUMA
+ extern void *__kmalloc_node_track_caller(size_t, gfp_t, int, unsigned long);
+@@ -723,30 +1044,78 @@ extern void *__kmalloc_node_track_caller(size_t, gfp_t, int, unsigned long);
+ 	__kmalloc_node_track_caller(size, flags, node, \
+ 			_RET_IP_)
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++extern void *__kmalloc_node_track_caller_memhook(size_t, gfp_t, int, unsigned long, 
++	unsigned long, call_function_t);
++#define kmalloc_node_track_caller_memhook(size, flags, node, caller_address, cf_type) \
++	__kmalloc_node_track_caller(size, flags, node, \
++			_RET_IP_, caller_address, cf_type)
++#endif
++
+ #else /* CONFIG_NUMA */
+ 
+ #define kmalloc_node_track_caller(size, flags, node) \
+ 	kmalloc_track_caller(size, flags)
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++#define kmalloc_node_track_caller_memhook(size, flags, node, caller_address, cf_type) \
++	kmalloc_track_caller_memhook(size, flags, caller_address, cf_type)
++#endif
++
+ #endif /* CONFIG_NUMA */
+ 
+ /*
+  * Shortcuts
+  */
++#ifdef CONFIG_DEBUG_KMALLOC
++static inline void *kmem_cache_zalloc_memhook(struct kmem_cache *k, gfp_t flags, \
++	unsigned long caller_address, call_function_t cf_type)
++{
++	return kmem_cache_alloc_memhook(k, flags | __GFP_ZERO, caller_address, cf_type);
++}
++
+ static inline void *kmem_cache_zalloc(struct kmem_cache *k, gfp_t flags)
+ {
+-	return kmem_cache_alloc(k, flags | __GFP_ZERO);
++	unsigned long caller_address;
++	call_function_t cf_type = KMEM_CACHE_ZALLOC;
++
++	caller_address = (unsigned long)get_pc();
++
++	return kmem_cache_zalloc_memhook(k, flags, caller_address, cf_type);
+ }
+ 
++#else
++static inline void *kmem_cache_zalloc(struct kmem_cache *k, gfp_t flags)
++{
++	return kmem_cache_alloc(k, flags | __GFP_ZERO);
++}
++#endif/*CONFIG_DEBUG_KMALLOC*/
+ /**
+  * kzalloc - allocate memory. The memory is set to zero.
+  * @size: how many bytes of memory are required.
+  * @flags: the type of memory to allocate (see kmalloc).
+  */
++#ifdef CONFIG_DEBUG_KMALLOC
++static inline void *kzalloc_memhook(size_t size, gfp_t flags, unsigned long caller_address, call_function_t cf_type)
++{
++	return kmalloc_memhook(size, flags | __GFP_ZERO, caller_address, cf_type);
++}
++
++static inline void *kzalloc(size_t size, gfp_t flags)
++{
++	unsigned long caller_address;
++	call_function_t cf_type = KZALLOC;
++
++	caller_address = (unsigned long)get_pc();
++
++	return kzalloc_memhook(size, flags, caller_address, cf_type);
++}
++#else
+ static inline void *kzalloc(size_t size, gfp_t flags)
+ {
+ 	return kmalloc(size, flags | __GFP_ZERO);
+ }
++#endif/*CONFIG_DEBUG_KMALLOC*/
+ 
+ /**
+  * kzalloc_node - allocate zeroed memory from a particular memory node.
+@@ -754,10 +1123,27 @@ static inline void *kzalloc(size_t size, gfp_t flags)
+  * @flags: the type of memory to allocate (see kmalloc).
+  * @node: memory node from which to allocate
+  */
++#ifdef CONFIG_DEBUG_KMALLOC
++static inline void *kzalloc_node_memhook(size_t size, gfp_t flags, int node,
++	unsigned long caller_address, call_function_t cf_type)
++{
++	return kmalloc_node_memhook(size, flags | __GFP_ZERO, node, caller_address, cf_type);
++}
++static inline void *kzalloc_node(size_t size, gfp_t flags, int node)
++{
++	unsigned long caller_address;
++	call_function_t cf_type = KZALLOC_NODE;
++
++	caller_address = (unsigned long)get_pc();
++
++	return kzalloc_node_memhook(size, flags, node, caller_address, cf_type);
++}
++#else
+ static inline void *kzalloc_node(size_t size, gfp_t flags, int node)
+ {
+ 	return kmalloc_node(size, flags | __GFP_ZERO, node);
+ }
++#endif /*CONFIG_DEBUG_KMALLOC*/
+ 
+ unsigned int kmem_cache_size(struct kmem_cache *s);
+ void __init kmem_cache_init_late(void);
+diff --git a/init/Kconfig b/init/Kconfig
+index b890162cde14..ac8426714d42 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -547,7 +547,7 @@ config LOG_BUF_SHIFT
+ 	int "Kernel log buffer size (16 => 64KB, 17 => 128KB)"
+ 	range 12 25 if !H8300
+ 	range 12 19 if H8300
+-	default 17
++	default 25
+ 	depends on PRINTK
+ 	help
+ 	  Select the minimal kernel log buffer size as a power of 2.
+diff --git a/kernel/Makefile b/kernel/Makefile
+index ccc3a9c47930..04dd43fbfedb 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -12,6 +12,9 @@ obj-y     = fork.o exec_domain.o panic.o \
+ 	    notifier.o ksysfs.o cred.o reboot.o \
+ 	    async.o range.o smpboot.o ucount.o ktask.o
+ 
++
++obj-$(CONFIG_DEBUG_KMALLOC) += statis_memory.o
++
+ obj-$(CONFIG_MODULES) += kmod.o
+ obj-$(CONFIG_MULTIUSER) += groups.o
+ 
+diff --git a/kernel/module.c b/kernel/module.c
+index 69d0e28804a8..1f833e7b8b50 100644
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -70,6 +70,10 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/module.h>
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++#include <linux/statis_memory.h>
++#endif
++
+ #ifndef ARCH_SHF_SMALL
+ #define ARCH_SHF_SMALL 0
+ #endif
+@@ -3758,6 +3762,9 @@ static int load_module(struct load_info *info, const char __user *uargs,
+ 	struct module *mod;
+ 	long err = 0;
+ 	char *after_dashes;
++#ifdef CONFIG_DEBUG_KMALLOC
++	struct module_usedmemory_attribute *uattr;
++#endif
+ 
+ 	err = elf_header_check(info);
+ 	if (err)
+@@ -3894,6 +3901,20 @@ static int load_module(struct load_info *info, const char __user *uargs,
+ 			goto sysfs_cleanup;
+ 	}
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++	uattr = kzalloc(sizeof(struct module_usedmemory_attribute), GFP_KERNEL);
++	uattr->mattr.attr.name = "usedmemory";
++	uattr->mattr.attr.mode = S_IRUGO;
++	uattr->mattr.show = __module_usedmemory_show;
++	uattr->mod = mod;
++	uattr->used = "NULL";
++	err = sysfs_create_file(&mod->mkobj.kobj, &uattr->mattr.attr);
++	mod->mkobj.used_memory = 0;
++	mod->mkobj.used_pages = 0;
++	if (err < 0)
++		goto coming_cleanup;
++#endif
++
+ 	/* Get rid of temporary copy. */
+ 	free_copy(info);
+ 
+@@ -4476,6 +4497,10 @@ struct module *__module_text_address(unsigned long addr)
+ 	return mod;
+ }
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++EXPORT_SYMBOL(__module_text_address);
++#endif
++
+ /* Don't grab lock, we're oopsing. */
+ void print_modules(void)
+ {
+diff --git a/kernel/params.c b/kernel/params.c
+index ce89f757e6da..18d28d377499 100644
+--- a/kernel/params.c
++++ b/kernel/params.c
+@@ -740,10 +740,13 @@ void destroy_params(const struct kernel_param *params, unsigned num)
+ 			params[i].ops->free(params[i].arg);
+ }
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++#include <linux/statis_memory.h>
+ static struct module_kobject * __init locate_module_kobject(const char *name)
+ {
+ 	struct module_kobject *mk;
+ 	struct kobject *kobj;
++	//struct module_usedmemory_attribute *uattr;
+ 	int err;
+ 
+ 	kobj = kset_find_obj(module_kset, name);
+@@ -770,11 +773,56 @@ static struct module_kobject * __init locate_module_kobject(const char *name)
+ 
+ 		/* So that we hold reference in both cases. */
+ 		kobject_get(&mk->kobj);
++// #ifdef CONFIG_DEBUG_KMALLOC
++// 		uattr = kzalloc(sizeof(struct module_usedmemory_attribute), GFP_KERNEL);
++// 		uattr->mattr.attr.name = "usedmemory";
++// 		uattr->mattr.attr.mode = S_IRUGO;
++// 		uattr->mattr.show = __module_usedmemory_show;
++// 		uattr->mod = mk->mod;
++// 		uattr->used = "NULL";
++// 		mk->module_memory = kzalloc(MAX_STATIS_BUF_SIZE, GFP_KERNEL);
++// 		err = sysfs_create_file(&mk->kobj, &uattr->mattr.attr);
++// #endif
+ 	}
+ 
+ 	return mk;
+ }
+ 
++#else /*CONFIG_DEBUG_KMALLOC*/
++static struct module_kobject * __init locate_module_kobject(const char *name)
++{
++	struct module_kobject *mk;
++	struct kobject *kobj;
++	int err;
++
++	kobj = kset_find_obj(module_kset, name);
++	if (kobj) {
++		mk = to_module_kobject(kobj);
++	} else {
++		mk = kzalloc(sizeof(struct module_kobject), GFP_KERNEL);
++		BUG_ON(!mk);
++
++		mk->mod = THIS_MODULE;
++		mk->kobj.kset = module_kset;
++		err = kobject_init_and_add(&mk->kobj, &module_ktype, NULL,
++					   "%s", name);
++#ifdef CONFIG_MODULES
++		if (!err)
++			err = sysfs_create_file(&mk->kobj, &module_uevent.attr);
++#endif
++		if (err) {
++			kobject_put(&mk->kobj);
++			pr_crit("Adding module '%s' to sysfs failed (%d), the system may be unstable.\n",
++				name, err);
++			return NULL;
++		}
++
++		/* So that we hold reference in both cases. */
++		kobject_get(&mk->kobj);
++	}
++}
++#endif
++
+ static void __init kernel_add_sysfs_param(const char *name,
+ 					  const struct kernel_param *kparam,
+ 					  unsigned int name_skip)
+@@ -830,6 +878,7 @@ static void __init param_sysfs_builtin(void)
+ 			name_len = dot - kp->name + 1;
+ 			strlcpy(modname, kp->name, name_len);
+ 		}
++		//printk(KERN_DEBUG "kernel_param:%s\n", kp->name);
+ 		kernel_add_sysfs_param(modname, kp, name_len);
+ 	}
+ }
+@@ -867,6 +916,25 @@ static void __init version_sysfs_builtin(void)
+ 
+ /* module-related sysfs stuff */
+ 
++//adventural
++#ifdef CONFIG_DEBUG_KMALLOC
++#include <linux/statis_memory.h>
++
++ssize_t __module_usedmemory_show(struct module_attribute * mattr,
++				     struct module_kobject *mk, char* buf)
++{
++	//struct module_usedmemory_attribute *usedattr;
++	//usedattr = container_of(mattr, struct module_usedmemory_attribute, mattr);
++	//printk(KERN_DEBUG "kmalloc:%lu\n", kmalloc_total);
++	printk(KERN_DEBUG "usedmemory:%d\n", mk->used_memory);
++	if(mk->used_memory >= 1024*100)
++		return scnprintf(buf, PAGE_SIZE, "Slab:%dkb\nPages:%u\n", mk->used_memory/1024, mk->used_pages);
++	else
++		return scnprintf(buf, PAGE_SIZE, "Slab:%dbytes\nPages:%u\n", mk->used_memory, mk->used_pages);
++}
++
++#endif
++
+ static ssize_t module_attr_show(struct kobject *kobj,
+ 				struct attribute *attr,
+ 				char *buf)
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 12601505c4a4..5437c2504b99 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -1,6 +1,12 @@
+ 
+ menu "Memory Management options"
+ 
++config DEBUG_KMALLOC
++	bool "Kmalloc debug"
++	default y
++	help
++	 Hook kmalloc
++
+ config SELECT_MEMORY_MODEL
+ 	def_bool y
+ 	depends on ARCH_SELECT_MEMORY_MODEL
+diff --git a/mm/mempool.c b/mm/mempool.c
+index 0ef8cc8d1602..88429c8a028d 100644
+--- a/mm/mempool.c
++++ b/mm/mempool.c
+@@ -364,6 +364,91 @@ EXPORT_SYMBOL(mempool_resize);
+  * fail if called from an IRQ context.)
+  * Note: using __GFP_ZERO is not supported.
+  */
++#ifdef CONFIG_DEBUG_KMALLOC
++void *mempool_alloc_memhook(mempool_t *pool, gfp_t gfp_mask, 
++	unsigned long caller_address, call_function_t cf_type)
++{
++	void *element;
++	unsigned long flags;
++	wait_queue_entry_t wait;
++	gfp_t gfp_temp;
++
++	VM_WARN_ON_ONCE(gfp_mask & __GFP_ZERO);
++	might_sleep_if(gfp_mask & __GFP_DIRECT_RECLAIM);
++
++	gfp_mask |= __GFP_NOMEMALLOC;	/* don't allocate emergency reserves */
++	gfp_mask |= __GFP_NORETRY;	/* don't loop in __alloc_pages */
++	gfp_mask |= __GFP_NOWARN;	/* failures are OK */
++
++	gfp_temp = gfp_mask & ~(__GFP_DIRECT_RECLAIM|__GFP_IO);
++
++repeat_alloc:
++
++	element = pool->alloc(gfp_temp, pool->pool_data);
++	if (likely(element != NULL)){
++		record_to_sysfs(ksize(element), element, caller_address, cf_type);
++		return element;
++	}
++
++	spin_lock_irqsave(&pool->lock, flags);
++	if (likely(pool->curr_nr)) {
++		element = remove_element(pool);
++		spin_unlock_irqrestore(&pool->lock, flags);
++		/* paired with rmb in mempool_free(), read comment there */
++		smp_wmb();
++		/*
++		 * Update the allocation stack trace as this is more useful
++		 * for debugging.
++		 */
++		kmemleak_update_trace(element);
++		record_to_sysfs(ksize(element), element, caller_address, cf_type);
++		return element;
++	}
++
++	/*
++	 * We use gfp mask w/o direct reclaim or IO for the first round.  If
++	 * alloc failed with that and @pool was empty, retry immediately.
++	 */
++	if (gfp_temp != gfp_mask) {
++		spin_unlock_irqrestore(&pool->lock, flags);
++		gfp_temp = gfp_mask;
++		goto repeat_alloc;
++	}
++
++	/* We must not sleep if !__GFP_DIRECT_RECLAIM */
++	if (!(gfp_mask & __GFP_DIRECT_RECLAIM)) {
++		spin_unlock_irqrestore(&pool->lock, flags);
++		return NULL;
++	}
++
++	/* Let's wait for someone else to return an element to @pool */
++	init_wait(&wait);
++	prepare_to_wait(&pool->wait, &wait, TASK_UNINTERRUPTIBLE);
++
++	spin_unlock_irqrestore(&pool->lock, flags);
++
++	/*
++	 * FIXME: this should be io_schedule().  The timeout is there as a
++	 * workaround for some DM problems in 2.6.18.
++	 */
++	io_schedule_timeout(5*HZ);
++
++	finish_wait(&pool->wait, &wait);
++	goto repeat_alloc;
++}
++EXPORT_SYMBOL(mempool_alloc_memhook);
++
++void *mempool_alloc(mempool_t *pool, gfp_t gfp_mask)
++{
++	unsigned long caller_address;
++	call_function_t cf_type = MEMPOOL_ALLOC;
++
++	caller_address = (unsigned long)_RET_IP_;
++
++	return mempool_alloc_memhook(pool, gfp_mask, caller_address, cf_type);
++}
++EXPORT_SYMBOL(mempool_alloc);
++#else
+ void *mempool_alloc(mempool_t *pool, gfp_t gfp_mask)
+ {
+ 	void *element;
+@@ -432,6 +517,7 @@ void *mempool_alloc(mempool_t *pool, gfp_t gfp_mask)
+ 	goto repeat_alloc;
+ }
+ EXPORT_SYMBOL(mempool_alloc);
++#endif
+ 
+ /**
+  * mempool_free - return an element to the pool.
+@@ -441,6 +527,71 @@ EXPORT_SYMBOL(mempool_alloc);
+  *
+  * this function only sleeps if the free_fn() function sleeps.
+  */
++#ifdef CONFIG_DEBUG_KMALLOC
++void mempool_free_memhook(void *element, mempool_t *pool, unsigned long caller_address)
++{
++	unsigned long flags;
++
++	if (unlikely(element == NULL))
++		return;
++
++	/*
++	 * Paired with the wmb in mempool_alloc().  The preceding read is
++	 * for @element and the following @pool->curr_nr.  This ensures
++	 * that the visible value of @pool->curr_nr is from after the
++	 * allocation of @element.  This is necessary for fringe cases
++	 * where @element was passed to this task without going through
++	 * barriers.
++	 *
++	 * For example, assume @p is %NULL at the beginning and one task
++	 * performs "p = mempool_alloc(...);" while another task is doing
++	 * "while (!p) cpu_relax(); mempool_free(p, ...);".  This function
++	 * may end up using curr_nr value which is from before allocation
++	 * of @p without the following rmb.
++	 */
++	smp_rmb();
++
++	/*
++	 * For correctness, we need a test which is guaranteed to trigger
++	 * if curr_nr + #allocated == min_nr.  Testing curr_nr < min_nr
++	 * without locking achieves that and refilling as soon as possible
++	 * is desirable.
++	 *
++	 * Because curr_nr visible here is always a value after the
++	 * allocation of @element, any task which decremented curr_nr below
++	 * min_nr is guaranteed to see curr_nr < min_nr unless curr_nr gets
++	 * incremented to min_nr afterwards.  If curr_nr gets incremented
++	 * to min_nr after the allocation of @element, the elements
++	 * allocated after that are subject to the same guarantee.
++	 *
++	 * Waiters happen iff curr_nr is 0 and the above guarantee also
++	 * ensures that there will be frees which return elements to the
++	 * pool waking up the waiters.
++	 */
++	if (unlikely(pool->curr_nr < pool->min_nr)) {
++		spin_lock_irqsave(&pool->lock, flags);
++		if (likely(pool->curr_nr < pool->min_nr)) {
++			add_element(pool, element);
++			spin_unlock_irqrestore(&pool->lock, flags);
++			wake_up(&pool->wait);
++			return;
++		}
++		spin_unlock_irqrestore(&pool->lock, flags);
++	}
++	//free_mem_record(caller_address, ksize(element)); //double free
++	pool->free(element, pool->pool_data);
++	//free_mem_record(caller_address, ksize(element)); //same
++}
++EXPORT_SYMBOL(mempool_free_memhook);
++
++void mempool_free(void *element, mempool_t *pool)
++{
++	unsigned long caller_address = _RET_IP_;
++		
++	mempool_free_memhook(element, pool, caller_address);
++}
++EXPORT_SYMBOL(mempool_free);
++#else
+ void mempool_free(void *element, mempool_t *pool)
+ {
+ 	unsigned long flags;
+@@ -494,6 +645,7 @@ void mempool_free(void *element, mempool_t *pool)
+ 	pool->free(element, pool->pool_data);
+ }
+ EXPORT_SYMBOL(mempool_free);
++#endif
+ 
+ /*
+  * A commonly used alloc and free fn.
+diff --git a/mm/slab_common.c b/mm/slab_common.c
+index d208b47e01a8..38b8ac46dc9d 100644
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@ -1576,6 +1576,28 @@ late_initcall(memcg_slabinfo_init);
+ #endif /* CONFIG_DEBUG_FS && CONFIG_MEMCG_KMEM */
+ #endif /* CONFIG_SLAB || CONFIG_SLUB_DEBUG */
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++static __always_inline void *__do_krealloc_memhook(const void *p, size_t new_size,
++					   gfp_t flags, unsigned long caller_address, call_function_t cf_type)
++{
++	void *ret;
++	size_t ks = 0;
++
++	if (p)
++		ks = ksize(p);
++
++	if (ks >= new_size) {
++		kasan_krealloc((void *)p, new_size, flags);
++		return (void *)p;
++	}
++
++	ret = kmalloc_track_caller_memhook(new_size, flags, caller_address, cf_type);
++	if (ret && p)
++		memcpy(ret, p, ks);
++
++	return ret;
++}
++#endif
+ static __always_inline void *__do_krealloc(const void *p, size_t new_size,
+ 					   gfp_t flags)
+ {
+@@ -1596,7 +1618,6 @@ static __always_inline void *__do_krealloc(const void *p, size_t new_size,
+ 
+ 	return ret;
+ }
+-
+ /**
+  * __krealloc - like krealloc() but don't free @p.
+  * @p: object to reallocate memory for.
+@@ -1607,6 +1628,25 @@ static __always_inline void *__do_krealloc(const void *p, size_t new_size,
+  * allocated buffer. Use this if you don't want to free the buffer immediately
+  * like, for example, with RCU.
+  */
++#ifdef CONFIG_DEBUG_KMALLOC
++void *__krealloc(const void *p, size_t new_size, gfp_t flags)
++{
++	void* ret;
++	unsigned long caller_address;
++	call_function_t cf_type = __KREALLOC;
++
++	caller_address = (unsigned long)_RET_IP_;
++
++	if (unlikely(!new_size))
++		return ZERO_SIZE_PTR;
++
++	ret = __do_krealloc_memhook(p, new_size, flags, caller_address, cf_type);
++
++	return ret;
++
++}
++EXPORT_SYMBOL(__krealloc);
++#else
+ void *__krealloc(const void *p, size_t new_size, gfp_t flags)
+ {
+ 	if (unlikely(!new_size))
+@@ -1616,6 +1656,7 @@ void *__krealloc(const void *p, size_t new_size, gfp_t flags)
+ 
+ }
+ EXPORT_SYMBOL(__krealloc);
++#endif
+ 
+ /**
+  * krealloc - reallocate memory. The contents will remain unchanged.
+@@ -1628,6 +1669,29 @@ EXPORT_SYMBOL(__krealloc);
+  * behaves exactly like kmalloc().  If @new_size is 0 and @p is not a
+  * %NULL pointer, the object pointed to is freed.
+  */
++#ifdef CONFIG_DEBUG_KMALLOC
++void *krealloc(const void *p, size_t new_size, gfp_t flags)
++{
++	void* ret;
++	unsigned long caller_address;
++	call_function_t cf_type = KREALLOC;
++
++	caller_address = (unsigned long)_RET_IP_;
++
++	if (unlikely(!new_size)) {
++		kfree(p);
++		return ZERO_SIZE_PTR;
++	}
++
++	ret = __do_krealloc_memhook(p, new_size, flags, caller_address, cf_type);
++
++	if (ret && p != ret)
++		kfree(p);
++
++	return ret;
++}
++EXPORT_SYMBOL(krealloc);
++#else
+ void *krealloc(const void *p, size_t new_size, gfp_t flags)
+ {
+ 	void *ret;
+@@ -1644,6 +1708,7 @@ void *krealloc(const void *p, size_t new_size, gfp_t flags)
+ 	return ret;
+ }
+ EXPORT_SYMBOL(krealloc);
++#endif
+ 
+ /**
+  * kzfree - like kfree but zero memory
+@@ -1656,6 +1721,23 @@ EXPORT_SYMBOL(krealloc);
+  * deal bigger than the requested buffer size passed to kmalloc(). So be
+  * careful when using this function in performance sensitive code.
+  */
++#ifdef CONFIG_DEBUG_KMALLOC
++void kzfree(const void *p)
++{
++	size_t ks;
++	void *mem = (void *)p;
++	unsigned long caller_address;
++
++	caller_address = (unsigned long)_RET_IP_;
++
++	if (unlikely(ZERO_OR_NULL_PTR(mem)))
++		return;
++	ks = ksize(mem);
++	memzero_explicit(mem, ks);
++	kfree_memhook(mem, caller_address);
++}
++EXPORT_SYMBOL(kzfree);
++#else
+ void kzfree(const void *p)
+ {
+ 	size_t ks;
+@@ -1668,6 +1750,7 @@ void kzfree(const void *p)
+ 	kfree(mem);
+ }
+ EXPORT_SYMBOL(kzfree);
++#endif
+ 
+ /* Tracepoints definitions. */
+ EXPORT_TRACEPOINT_SYMBOL(kmalloc);
+diff --git a/mm/slub.c b/mm/slub.c
+index 30683ffe1823..cbcfadc10dec 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -2739,6 +2739,31 @@ static __always_inline void *slab_alloc(struct kmem_cache *s,
+ 	return slab_alloc_node(s, gfpflags, NUMA_NO_NODE, addr);
+ }
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++void *kmem_cache_alloc(struct kmem_cache *s, gfp_t gfpflags)
++{
++	unsigned long caller_address;
++	call_function_t cf_type = KMEM_CACHE_ALLOC;
++
++	caller_address = (unsigned long)_RET_IP_;
++
++	return kmem_cache_alloc_memhook(s, gfpflags, caller_address, cf_type);
++}
++EXPORT_SYMBOL(kmem_cache_alloc);
++
++void *kmem_cache_alloc_memhook(struct kmem_cache *s, gfp_t gfpflags, unsigned long caller_address, call_function_t cf_type)
++{
++	void *ret = slab_alloc(s, gfpflags, _RET_IP_);
++
++	trace_kmem_cache_alloc(_RET_IP_, ret, s->object_size,
++				s->size, gfpflags);
++
++	record_to_sysfs(s->object_size, ret, caller_address, cf_type);
++
++	return ret;
++}
++EXPORT_SYMBOL(kmem_cache_alloc_memhook);
++#else
+ void *kmem_cache_alloc(struct kmem_cache *s, gfp_t gfpflags)
+ {
+ 	void *ret = slab_alloc(s, gfpflags, _RET_IP_);
+@@ -2749,8 +2774,32 @@ void *kmem_cache_alloc(struct kmem_cache *s, gfp_t gfpflags)
+ 	return ret;
+ }
+ EXPORT_SYMBOL(kmem_cache_alloc);
++#endif/*CONFIG_DEBUG_KMALLOC*/
+ 
+ #ifdef CONFIG_TRACING
++
++#ifdef CONFIG_DEBUG_KMALLOC
++void *kmem_cache_alloc_trace_memhook(struct kmem_cache *s, gfp_t gfpflags, size_t size, \
++	unsigned long caller_address, call_function_t cf_type)
++{
++	void *ret = slab_alloc(s, gfpflags, _RET_IP_);
++	trace_kmalloc(_RET_IP_, ret, size, s->size, gfpflags);
++	kasan_kmalloc(s, ret, size, gfpflags);
++	record_to_sysfs(s->object_size, ret, caller_address, cf_type);
++	return ret;
++}
++EXPORT_SYMBOL(kmem_cache_alloc_trace_memhook);
++void *kmem_cache_alloc_trace(struct kmem_cache *s, gfp_t gfpflags, size_t size)
++{
++	unsigned long caller_address;
++	call_function_t cf_type = KMEM_CACHE_ALLOC_TRACE;
++
++	caller_address = (unsigned long)_RET_IP_;
++
++	return kmem_cache_alloc_trace_memhook(s, gfpflags, size, caller_address, cf_type);
++}
++EXPORT_SYMBOL(kmem_cache_alloc_trace);
++#else
+ void *kmem_cache_alloc_trace(struct kmem_cache *s, gfp_t gfpflags, size_t size)
+ {
+ 	void *ret = slab_alloc(s, gfpflags, _RET_IP_);
+@@ -2759,9 +2808,38 @@ void *kmem_cache_alloc_trace(struct kmem_cache *s, gfp_t gfpflags, size_t size)
+ 	return ret;
+ }
+ EXPORT_SYMBOL(kmem_cache_alloc_trace);
+-#endif
++#endif/*CONFIG_DEBUG_KMALLOC*/
++#endif/*CONFIG_TRACING*/
+ 
+ #ifdef CONFIG_NUMA
++
++#ifdef CONFIG_DEBUG_KMALLOC
++void *kmem_cache_alloc_node(struct kmem_cache *s, gfp_t gfpflags, int node)
++{
++	unsigned long caller_address;
++	call_function_t cf_type = KMEM_CACHE_ALLOC_NODE;
++
++	caller_address = (unsigned long)_RET_IP_;
++
++	return kmem_cache_alloc_node_memhook(s, gfpflags, node, caller_address, cf_type);
++}
++EXPORT_SYMBOL(kmem_cache_alloc_node);
++
++void *kmem_cache_alloc_node_memhook(struct kmem_cache *s, gfp_t gfpflags, int node, 
++	unsigned long caller_address, call_function_t cf_type)
++{
++	void *ret = slab_alloc_node(s, gfpflags, node, _RET_IP_);
++
++	trace_kmem_cache_alloc_node(_RET_IP_, ret,
++				    s->object_size, s->size, gfpflags, node);
++
++	record_to_sysfs(s->object_size, ret, caller_address, cf_type);
++
++	return ret;
++}
++EXPORT_SYMBOL(kmem_cache_alloc_node_memhook);
++
++#else
+ void *kmem_cache_alloc_node(struct kmem_cache *s, gfp_t gfpflags, int node)
+ {
+ 	void *ret = slab_alloc_node(s, gfpflags, node, _RET_IP_);
+@@ -2772,8 +2850,42 @@ void *kmem_cache_alloc_node(struct kmem_cache *s, gfp_t gfpflags, int node)
+ 	return ret;
+ }
+ EXPORT_SYMBOL(kmem_cache_alloc_node);
++#endif /*CONFIG_DEBUG_KMALLOC*/
+ 
+ #ifdef CONFIG_TRACING
++
++#ifdef CONFIG_DEBUG_KMALLOC
++void *kmem_cache_alloc_node_trace(struct kmem_cache *s,
++				    gfp_t gfpflags,
++				    int node, size_t size)
++{
++	unsigned long caller_address;
++	call_function_t cf_type = KMEM_CACHE_ALLOC_NODE_TRACE;
++
++	caller_address = (unsigned long)_RET_IP_;
++
++	return kmem_cache_alloc_node_trace_memhook(s, gfpflags, node, size, caller_address, cf_type);
++}
++EXPORT_SYMBOL(kmem_cache_alloc_node_trace);
++
++void *kmem_cache_alloc_node_trace_memhook(struct kmem_cache *s,
++				    gfp_t gfpflags, int node, size_t size, 
++					unsigned long caller_address, call_function_t cf_type)
++{
++	void *ret = slab_alloc_node(s, gfpflags, node, _RET_IP_);
++
++	trace_kmalloc_node(_RET_IP_, ret,
++			   size, s->size, gfpflags, node);
++
++	kasan_kmalloc(s, ret, size, gfpflags);
++
++	record_to_sysfs(s->object_size, ret, caller_address, cf_type);
++
++	return ret;
++}
++EXPORT_SYMBOL(kmem_cache_alloc_node_trace_memhook);
++
++#else
+ void *kmem_cache_alloc_node_trace(struct kmem_cache *s,
+ 				    gfp_t gfpflags,
+ 				    int node, size_t size)
+@@ -2787,6 +2899,7 @@ void *kmem_cache_alloc_node_trace(struct kmem_cache *s,
+ 	return ret;
+ }
+ EXPORT_SYMBOL(kmem_cache_alloc_node_trace);
++#endif  /*CONFIG_DEBUG_KMALLOC*/
+ #endif
+ #endif	/* CONFIG_NUMA */
+ 
+@@ -2988,6 +3101,27 @@ void ___cache_free(struct kmem_cache *cache, void *x, unsigned long addr)
+ }
+ #endif
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++void kmem_cache_free_memhook(struct kmem_cache *s, void *x, unsigned long caller_address)
++{
++	s = cache_from_obj(s, x);
++	if (!s)
++		return;
++	slab_free(s, virt_to_head_page(x), x, NULL, 1, _RET_IP_);
++	trace_kmem_cache_free(_RET_IP_, x);
++
++	free_mem_record(caller_address, s->object_size);
++}
++EXPORT_SYMBOL(kmem_cache_free_memhook);
++
++void kmem_cache_free(struct kmem_cache *s, void *x)
++{
++	unsigned long caller_address = (unsigned long)_RET_IP_;
++	
++	kmem_cache_free_memhook(s, x, caller_address);
++}
++EXPORT_SYMBOL(kmem_cache_free);
++#else
+ void kmem_cache_free(struct kmem_cache *s, void *x)
+ {
+ 	s = cache_from_obj(s, x);
+@@ -2997,6 +3131,7 @@ void kmem_cache_free(struct kmem_cache *s, void *x)
+ 	trace_kmem_cache_free(_RET_IP_, x);
+ }
+ EXPORT_SYMBOL(kmem_cache_free);
++#endif
+ 
+ struct detached_freelist {
+ 	struct page *page;
+@@ -3090,6 +3225,28 @@ int build_detached_freelist(struct kmem_cache *s, size_t size,
+ }
+ 
+ /* Note that interrupts must be enabled when calling this function. */
++#ifdef CONFIG_DEBUG_KMALLOC
++void kmem_cache_free_bulk(struct kmem_cache *s, size_t size, void **p)
++{
++	unsigned long caller_address = (unsigned long)_RET_IP_;
++	if (WARN_ON(!size))
++		return;
++
++	do {
++		struct detached_freelist df;
++
++		size = build_detached_freelist(s, size, p, &df);
++		if (!df.page)
++			continue;
++
++		slab_free(df.s, df.page, df.freelist, df.tail, df.cnt,_RET_IP_);
++
++		free_mem_record(caller_address, s->object_size);
++
++	} while (likely(size));
++}
++EXPORT_SYMBOL(kmem_cache_free_bulk);
++#else
+ void kmem_cache_free_bulk(struct kmem_cache *s, size_t size, void **p)
+ {
+ 	if (WARN_ON(!size))
+@@ -3106,8 +3263,91 @@ void kmem_cache_free_bulk(struct kmem_cache *s, size_t size, void **p)
+ 	} while (likely(size));
+ }
+ EXPORT_SYMBOL(kmem_cache_free_bulk);
++#endif
+ 
+ /* Note that interrupts must be enabled when calling this function. */
++#ifdef CONFIG_DEBUG_KMALLOC
++int kmem_cache_alloc_bulk_memhook(struct kmem_cache *s, gfp_t flags, size_t size,
++			  void **p, unsigned long caller_address, call_function_t cf_type)
++{
++	struct kmem_cache_cpu *c;
++	int i;
++
++	/* memcg and kmem_cache debug support */
++	s = slab_pre_alloc_hook(s, flags);
++	if (unlikely(!s))
++		return false;
++	/*
++	 * Drain objects in the per cpu slab, while disabling local
++	 * IRQs, which protects against PREEMPT and interrupts
++	 * handlers invoking normal fastpath.
++	 */
++	local_irq_disable();
++	c = this_cpu_ptr(s->cpu_slab);
++
++	for (i = 0; i < size; i++) {
++		void *object = c->freelist;
++
++		if (unlikely(!object)) {
++			/*
++			 * We may have removed an object from c->freelist using
++			 * the fastpath in the previous iteration; in that case,
++			 * c->tid has not been bumped yet.
++			 * Since ___slab_alloc() may reenable interrupts while
++			 * allocating memory, we should bump c->tid now.
++			 */
++			c->tid = next_tid(c->tid);
++
++			/*
++			 * Invoking slow path likely have side-effect
++			 * of re-populating per CPU c->freelist
++			 */
++			p[i] = ___slab_alloc(s, flags, NUMA_NO_NODE,
++					    _RET_IP_, c);
++			if (unlikely(!p[i]))
++				goto error;
++
++			c = this_cpu_ptr(s->cpu_slab);
++
++			record_to_sysfs(s->object_size, p[i], caller_address, cf_type);
++
++			continue; /* goto for-loop */
++		}
++		c->freelist = get_freepointer(s, object);
++		p[i] = object;
++		record_to_sysfs(s->object_size, p[i], caller_address, cf_type);
++	}
++	c->tid = next_tid(c->tid);
++	local_irq_enable();
++
++	/* Clear memory outside IRQ disabled fastpath loop */
++	if (unlikely(flags & __GFP_ZERO)) {
++		int j;
++
++		for (j = 0; j < i; j++)
++			memset(p[j], 0, s->object_size);
++	}
++
++	/* memcg and kmem_cache debug support */
++	slab_post_alloc_hook(s, flags, size, p);
++	return i;
++error:
++	local_irq_enable();
++	slab_post_alloc_hook(s, flags, i, p);
++	__kmem_cache_free_bulk(s, i, p);
++	return 0;
++}
++
++int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
++			  void **p)
++{
++	unsigned long caller_address = (unsigned long)_RET_IP_;
++	call_function_t cf_type =  KMEM_CACHE_ALLOC_BULK;
++
++	return kmem_cache_alloc_bulk_memhook(s, flags, size, p, caller_address, cf_type);
++}
++EXPORT_SYMBOL(kmem_cache_alloc_bulk);
++#else
+ int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
+ 			  void **p)
+ {
+@@ -3175,7 +3415,7 @@ int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
+ 	return 0;
+ }
+ EXPORT_SYMBOL(kmem_cache_alloc_bulk);
+-
++#endif
+ 
+ /*
+  * Object placement in a slab is made very easy because we always start at
+@@ -3766,6 +4006,44 @@ static int __init setup_slub_min_objects(char *str)
+ 
+ __setup("slub_min_objects=", setup_slub_min_objects);
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++void *__kmalloc(size_t size, gfp_t flags)
++{
++	unsigned long caller_address;
++	call_function_t cf_type = __KMALLOC;
++
++	caller_address = (unsigned long)_RET_IP_;
++
++	return __kmalloc_memhook(size, flags, caller_address, cf_type);
++}
++EXPORT_SYMBOL(__kmalloc);
++
++void *__kmalloc_memhook(size_t size, gfp_t flags, unsigned long caller_address, call_function_t cf_type)
++{
++	struct kmem_cache *s;
++	void *ret;
++
++	if (unlikely(size > KMALLOC_MAX_CACHE_SIZE))
++		return kmalloc_large_memhook(size, flags, caller_address, cf_type);
++
++	s = kmalloc_slab(size, flags);
++
++	if (unlikely(ZERO_OR_NULL_PTR(s)))
++		return s;
++
++	ret = slab_alloc(s, flags, _RET_IP_);
++
++	trace_kmalloc(_RET_IP_, ret, size, s->size, flags);
++
++	kasan_kmalloc(s, ret, size, flags);
++
++	record_to_sysfs(s->object_size, ret, caller_address, cf_type);
++
++	return ret;
++}
++EXPORT_SYMBOL(__kmalloc_memhook);
++
++#else
+ void *__kmalloc(size_t size, gfp_t flags)
+ {
+ 	struct kmem_cache *s;
+@@ -3788,8 +4066,28 @@ void *__kmalloc(size_t size, gfp_t flags)
+ 	return ret;
+ }
+ EXPORT_SYMBOL(__kmalloc);
++#endif/*CONFIG_DEBUG_KMALLOC*/
+ 
+ #ifdef CONFIG_NUMA
++#ifdef CONFIG_DEBUG_KMALLOC
++static void *kmalloc_large_node_memhook(size_t size, gfp_t flags, int node, 
++	unsigned long caller_address, call_function_t cf_type)
++{
++	struct page *page;
++	void *ptr = NULL;
++
++	flags |= __GFP_COMP;
++	page = alloc_pages_node(node, flags, get_order(size));
++	if (page)
++		ptr = page_address(page);
++
++	kmalloc_large_node_hook(ptr, size, flags);
++
++	record_page_to_sysfs(get_order(size), ptr, caller_address, cf_type);
++
++	return ptr;
++}
++#else
+ static void *kmalloc_large_node(size_t size, gfp_t flags, int node)
+ {
+ 	struct page *page;
+@@ -3803,7 +4101,54 @@ static void *kmalloc_large_node(size_t size, gfp_t flags, int node)
+ 	kmalloc_large_node_hook(ptr, size, flags);
+ 	return ptr;
+ }
++#endif
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++void *__kmalloc_node(size_t size, gfp_t flags, int node)
++{
++	unsigned long caller_address;
++	call_function_t cf_type = __KMALLOC_NODE;
++
++	caller_address = (unsigned long)_RET_IP_;
++
++	return __kmalloc_node_memhook(size, flags, node, caller_address, cf_type);
++}
++EXPORT_SYMBOL(__kmalloc_node);
++
++void *__kmalloc_node_memhook(size_t size, gfp_t flags, int node, 
++	unsigned long caller_address, call_function_t cf_type)
++{
++	struct kmem_cache *s;
++	void *ret;
++
++	if (unlikely(size > KMALLOC_MAX_CACHE_SIZE)) {
++		ret = kmalloc_large_node_memhook(size, flags, node, caller_address, cf_type);
++
++		trace_kmalloc_node(_RET_IP_, ret,
++				   size, PAGE_SIZE << get_order(size),
++				   flags, node);
++
++		return ret;
++	}
++
++	s = kmalloc_slab(size, flags);
++
++	if (unlikely(ZERO_OR_NULL_PTR(s)))
++		return s;
++
++	ret = slab_alloc_node(s, flags, node, _RET_IP_);
++
++	trace_kmalloc_node(_RET_IP_, ret, size, s->size, flags, node);
++
++	kasan_kmalloc(s, ret, size, flags);
++
++	record_to_sysfs(s->object_size, ret, caller_address, cf_type);
++
++	return ret;
++}
++EXPORT_SYMBOL(__kmalloc_node_memhook);
++
++#else
+ void *__kmalloc_node(size_t size, gfp_t flags, int node)
+ {
+ 	struct kmem_cache *s;
+@@ -3833,6 +4178,8 @@ void *__kmalloc_node(size_t size, gfp_t flags, int node)
+ 	return ret;
+ }
+ EXPORT_SYMBOL(__kmalloc_node);
++#endif  /*CONFIG_DEBUG_KMALLOC*/
++
+ #endif	/* CONFIG_NUMA */
+ 
+ #ifdef CONFIG_HARDENED_USERCOPY
+@@ -3921,6 +4268,44 @@ size_t ksize(const void *object)
+ }
+ EXPORT_SYMBOL(ksize);
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++void kfree_memhook(const void *x, unsigned long caller_address)
++{
++	struct page *page;
++	void *object = (void *)x;
++
++	if (unlikely(ZERO_OR_NULL_PTR(x)))
++		return;
++
++	page = virt_to_head_page(x);
++	if (unlikely(!PageSlab(page))) {
++		BUG_ON(!PageCompound(page));
++		kfree_hook(object);
++		__free_pages(page, compound_order(page));
++		free_mem_record_page(caller_address, compound_order(page));
++		return;
++	}
++	slab_free(page->slab_cache, page, object, NULL, 1, _RET_IP_);
++
++	free_mem_record(caller_address, ksize(object));
++
++}
++EXPORT_SYMBOL(kfree_memhook);
++
++void kfree(const void *x)
++{
++	unsigned long caller_address;
++
++	caller_address = (unsigned long)_RET_IP_;
++
++	trace_kfree(_RET_IP_, x);
++
++	kfree_memhook(x, caller_address);
++
++}
++EXPORT_SYMBOL(kfree);
++
++#else
+ void kfree(const void *x)
+ {
+ 	struct page *page;
+@@ -3941,6 +4326,7 @@ void kfree(const void *x)
+ 	slab_free(page->slab_cache, page, object, NULL, 1, _RET_IP_);
+ }
+ EXPORT_SYMBOL(kfree);
++#endif
+ 
+ #define SHRINK_PROMOTE_MAX 32
+ 
+@@ -4303,6 +4689,44 @@ int __kmem_cache_create(struct kmem_cache *s, slab_flags_t flags)
+ 	return err;
+ }
+ 
++#ifdef CONFIG_DEBUG_KMALLOC
++void *__kmalloc_track_caller_memhook(size_t size, gfp_t gfpflags, unsigned long caller, \
++	unsigned long caller_address, call_function_t cf_type)
++{
++	struct kmem_cache *s;
++	void *ret;
++
++	if (unlikely(size > KMALLOC_MAX_CACHE_SIZE))
++		return kmalloc_large_memhook(size, gfpflags, caller_address, cf_type);
++
++	s = kmalloc_slab(size, gfpflags);
++
++	if (unlikely(ZERO_OR_NULL_PTR(s)))
++		return s;
++
++	ret = slab_alloc(s, gfpflags, caller);
++
++	/* Honor the call site pointer we received. */
++	trace_kmalloc(caller, ret, size, s->size, gfpflags);
++
++	record_to_sysfs(s->object_size, ret, caller_address, cf_type);
++
++	return ret;
++}
++
++void *__kmalloc_track_caller(size_t size, gfp_t gfpflags, unsigned long caller)
++{
++	void* ret;
++	unsigned long caller_address;
++	call_function_t cf_type = __KMALLOC_TRACK_CALLER;
++
++	caller_address = (unsigned long)_RET_IP_;
++
++	ret = __kmalloc_track_caller_memhook(size, gfpflags, caller, caller_address, cf_type);
++
++	return ret;
++}
++#else
+ void *__kmalloc_track_caller(size_t size, gfp_t gfpflags, unsigned long caller)
+ {
+ 	struct kmem_cache *s;
+@@ -4323,8 +4747,55 @@ void *__kmalloc_track_caller(size_t size, gfp_t gfpflags, unsigned long caller)
+ 
+ 	return ret;
+ }
++#endif
+ 
+ #ifdef CONFIG_NUMA
++#ifdef CONFIG_DEBUG_KMALLOC
++void *__kmalloc_node_track_caller_memhook(size_t size, gfp_t gfpflags, int node,
++	unsigned long caller, unsigned long caller_address, call_function_t cf_type)
++{
++	struct kmem_cache *s;
++	void *ret;
++
++	if (unlikely(size > KMALLOC_MAX_CACHE_SIZE)) {
++		ret = kmalloc_large_node_memhook(size, gfpflags, node, caller_address, cf_type);
++
++		trace_kmalloc_node(caller, ret,
++				   size, PAGE_SIZE << get_order(size),
++				   gfpflags, node);
++
++		return ret;
++	}
++
++	s = kmalloc_slab(size, gfpflags);
++
++	if (unlikely(ZERO_OR_NULL_PTR(s)))
++		return s;
++
++	ret = slab_alloc_node(s, gfpflags, node, caller);
++
++	/* Honor the call site pointer we received. */
++	trace_kmalloc_node(caller, ret, size, s->size, gfpflags, node);
++
++	record_to_sysfs(s->object_size, ret, caller_address, cf_type);
++
++	return ret;
++}
++
++void *__kmalloc_node_track_caller(size_t size, gfp_t gfpflags,
++					int node, unsigned long caller)
++{
++	void* ret;
++	unsigned long caller_address;
++	call_function_t cf_type = __KMALLOC_NODE_TRACK_CALLER;
++
++	caller_address = (unsigned long)_RET_IP_;
++
++	ret = __kmalloc_node_track_caller_memhook(size, gfpflags, node, caller, caller_address, cf_type);
++
++	return ret;
++}
++#else
+ void *__kmalloc_node_track_caller(size_t size, gfp_t gfpflags,
+ 					int node, unsigned long caller)
+ {
+@@ -4354,6 +4825,7 @@ void *__kmalloc_node_track_caller(size_t size, gfp_t gfpflags,
+ 	return ret;
+ }
+ #endif
++#endif
+ 
+ #ifdef CONFIG_SYSFS
+ static int count_inuse(struct page *page)
+-- 
+2.27.0
+
