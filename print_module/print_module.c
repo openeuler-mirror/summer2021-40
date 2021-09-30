@@ -15,17 +15,12 @@ struct mytest_struct{
 
 void kmalloc_test(void)
 {
-    unsigned char *kmalloctest;
-    unsigned char *kzalloctest;
-    unsigned char *__kmalloctest;
-    unsigned char *kcalloctest;
-    unsigned char *kmalloc_array_test;
+    unsigned char *kmalloctest = (unsigned char*)kmalloc(200, 0);
+    unsigned char *kzalloctest = (unsigned char*)kzalloc(150, GFP_KERNEL);
+    unsigned char *__kmalloctest = (unsigned char*)__kmalloc(8200, GFP_KERNEL);
+    unsigned char *kcalloctest = (unsigned char*)kcalloc(10, 30, GFP_KERNEL);
+    unsigned char *kmalloc_array_test = (unsigned char*)kmalloc_array(10, 40, GFP_KERNEL);
 
-    kmalloctest = (unsigned char*)kmalloc(200, 0);
-    kzalloctest = (unsigned char*)kzalloc(150, GFP_KERNEL);
-    __kmalloctest = (unsigned char*)__kmalloc(8200, GFP_KERNEL);
-    kcalloctest = (unsigned char*)kcalloc(10, 30, GFP_KERNEL);
-    kmalloc_array_test = (unsigned char*)kmalloc_array(10, 40, GFP_KERNEL);
 
     kfree(kmalloctest);
     kzfree(kzalloctest);
@@ -36,17 +31,11 @@ void kmalloc_test(void)
 
 void kmalloc_node_test(void)
 {
-    unsigned char *kmalloc_node_test;
-    unsigned char *kzalloc_node_test;
-    unsigned char *__kmalloc_node_test;
-    unsigned char *kcalloc_node_test;
-    unsigned char *kmalloc_array_node_test;
-
-    kmalloc_node_test = (unsigned char*)kmalloc_node(20, 0, 0);
-    kzalloc_node_test = (unsigned char*)kzalloc_node(20, GFP_KERNEL, 0);
-    __kmalloc_node_test = (unsigned char*)__kmalloc_node(92, GFP_KERNEL, 0);
-    kcalloc_node_test = (unsigned char*)kcalloc_node(20, 30, GFP_KERNEL, 0);
-    kmalloc_array_node_test = (unsigned char*)kmalloc_array_node(10, 10, GFP_KERNEL, 0);
+    unsigned char *kmalloc_node_test = (unsigned char*)kmalloc_node(20, 0, 0);
+    unsigned char *kzalloc_node_test = (unsigned char*)kzalloc_node(20, GFP_KERNEL, 0);
+    unsigned char *__kmalloc_node_test = (unsigned char*)__kmalloc_node(92, GFP_KERNEL, 0);
+    unsigned char *kcalloc_node_test = (unsigned char*)kcalloc_node(20, 30, GFP_KERNEL, 0);
+    unsigned char *kmalloc_array_node_test = (unsigned char*)kmalloc_array_node(10, 10, GFP_KERNEL, 0);
 
     kfree(kmalloc_node_test);
     kzfree(kzalloc_node_test);
@@ -57,10 +46,8 @@ void kmalloc_node_test(void)
 
 void krealloc_test(void)
 {
-    unsigned char *kmalloctest;
-    unsigned char *krealloctest;
-    kmalloctest = (unsigned char*)kmalloc(200, 0);
-    krealloctest = __krealloc(kmalloctest, 8193, GFP_KERNEL);
+    unsigned char *kmalloctest = (unsigned char*)kmalloc(200, 0);
+    unsigned char *krealloctest = __krealloc(kmalloctest, 8193, GFP_KERNEL);
 
     kfree(kmalloctest);
     kfree(krealloctest);
@@ -68,13 +55,9 @@ void krealloc_test(void)
 
 void kmem_cache_test(void)
 {
-    struct kmem_cache *cachep = NULL;
-    struct mytest_struct *bodyp = NULL;
-    struct mytest_struct *bodyp2 = NULL;
-
-    cachep = kmem_cache_create("adventural-cache", sizeof(struct mytest_struct), 0, SLAB_HWCACHE_ALIGN, NULL);
-    bodyp = (struct mytest_struct*) kmem_cache_alloc(cachep, GFP_ATOMIC & ~__GFP_DMA);
-    bodyp2 = (struct mytest_struct*) kmem_cache_zalloc(cachep, GFP_ATOMIC & ~__GFP_DMA);
+    struct kmem_cache *cachep = kmem_cache_create("adventural-cache", sizeof(struct mytest_struct), 0, SLAB_HWCACHE_ALIGN, NULL);
+    struct mytest_struct *bodyp = (struct mytest_struct*) kmem_cache_alloc(cachep, GFP_ATOMIC & ~__GFP_DMA);
+    struct mytest_struct *bodyp2 = (struct mytest_struct*) kmem_cache_zalloc(cachep, GFP_ATOMIC & ~__GFP_DMA);
 
     kmem_cache_free(cachep, bodyp);
     kmem_cache_free(cachep, bodyp2);
@@ -82,12 +65,8 @@ void kmem_cache_test(void)
 
 void kmem_cache_node_test(void)
 {
-    struct kmem_cache *cachep = NULL;
-    struct mytest_struct *bodyp_node = NULL;
-
-    cachep = kmem_cache_create("adventural-cache", sizeof(struct mytest_struct), 0, SLAB_HWCACHE_ALIGN, NULL);
-
-    bodyp_node = (struct mytest_struct*) kmem_cache_alloc_node(cachep, GFP_ATOMIC & ~__GFP_DMA, 0);
+    struct kmem_cache *cachep = kmem_cache_create("adventural-cache", sizeof(struct mytest_struct), 0, SLAB_HWCACHE_ALIGN, NULL);
+    struct mytest_struct * bodyp_node = (struct mytest_struct*) kmem_cache_alloc_node(cachep, GFP_ATOMIC & ~__GFP_DMA, 0);
 
     kmem_cache_free(cachep, bodyp_node);
 }
@@ -106,17 +85,11 @@ void kmem_cache_bulk_test(void)
 
 void buddy_test(void)
 {
-    struct page* page1;
-    struct page* page2;
-    unsigned long addr1;
-    unsigned long addr2;
-    void* addr3;
-
-    page1 = alloc_pages(GFP_KERNEL, 4);
-    page2 = alloc_pages_node(0, GFP_KERNEL, 3);
-    addr1 = get_zeroed_page(GFP_KERNEL);
-    addr2 = __get_free_pages(GFP_KERNEL, 2);
-    addr3 = alloc_pages_exact(8200, GFP_KERNEL);
+    struct page* page1 = alloc_pages(GFP_KERNEL, 4);
+    struct page* page2 = alloc_pages_node(0, GFP_KERNEL, 3);
+    unsigned long addr1 = get_zeroed_page(GFP_KERNEL);
+    unsigned long addr2 = __get_free_pages(GFP_KERNEL, 2);
+    void* addr3 = alloc_pages_exact(8200, GFP_KERNEL);
 
     __free_pages(page1, 4);
     __free_pages(page2, 3);
@@ -127,8 +100,7 @@ void buddy_test(void)
 
 void percpu_test(void)
 {
-    void __percpu* addr;
-    addr = alloc_percpu(int);
+    void __percpu* addr = alloc_percpu(int);
     free_percpu(addr);
 }
 
