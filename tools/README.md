@@ -1,15 +1,7 @@
 Summer2021-No.40 统计一个内核模块占用的内存
 
-#### 介绍
-https://gitee.com/openeuler-competition/summer-2021/issues/I3EFZU
-
-#### 文件说明
-
-0001-0001-statis.patch为中期考核的patch，完成了slab，memorypool的统计功能。
-
-0001-9-15.patch更新加入了buddy、percpu的内存分配统计功能。
-
-#### 辅助函数
+#### tools目录介绍
+##### getfunction.py文件
 
 getfunction.py函数提取了mm模块当中所有通过EXPORT_SYMBOL导出的函数，然后与drivers目录去比对，drivers目录内的文件使用到的函数记录到found.txt当中，未使用到的记录到not-found.txt当中，作为统计函数来源的参考。
 
@@ -112,33 +104,6 @@ zs_create_pool()
 zs_destroy_pool()
 ```
 
-##### 实际统计的有dma_pool、mempool、buddy、slab、percpu
+##### get.py文件
 
-vmalloc系列的函数最终会调用`__vmalloc_node_range`函数，该函数的参数当中就存在caller（返回地址），因此实际的统计只需要加一行，测试统计发现只有很少量的模块会使用到vmalloc系列函数因此0001-9-15.patch当中没有加入vmalloc
-
-#### slab函数图
-
-![image-20210915160044184](./img/image-20210915160044184.png)
-
-#### buddy函数图
-
-##### 图1
-
-![image-20210915160149629](./img/image-20210915160149629.png)
-
-##### 图2
-
-![image-20210915160203145](./img/image-20210915160203145.png)
-
-#### vmalloc函数图
-
-![image-20210915161246004](./img/image-20210915161246004.png)
-
-#### 参与贡献
-
-1.  Fork 本仓库
-2.  新建 Feat_xxx 分支
-3.  提交代码
-4.  新建 Pull Request
-
-6.  https://gitee.com/gitee-stars/)
+get.py文件提供的功能是读取所有模块下的usedmemory，然后将结果存储到memory.txt中
