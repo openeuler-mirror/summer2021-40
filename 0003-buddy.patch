@@ -1,7 +1,7 @@
 From 5499fe3d882bdcd3c322a6d4b680f1d9f23e122e Mon Sep 17 00:00:00 2001
 From: jiax <jiaxgong@163.com>
 Date: Tue, 28 Sep 2021 20:18:42 +0800
-Subject: [PATCH 3/4] buddy
+Subject: [PATCH 3/5] buddy
 
 ---
  mm/mempolicy.c  |  6 +++++
