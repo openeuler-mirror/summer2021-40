@@ -19,6 +19,10 @@ old-patch文件夹内存放中期考核成果0001-statis.patch，以及9月15日
 
 `0006-mempool.patch`：完成mempool的统计功能。
 
+`0007-update.patch`：原先的输出中会带有Records以及Record page信息，这是供调试用的，现已删除
+
+`0008-add-dmapool.patch`：新增了dmapool的统计功能
+
 #### 使用
 
 使用内核模块内存统计功能需要开启mm/Kconfig下的Kmalloc debug的配置选项
